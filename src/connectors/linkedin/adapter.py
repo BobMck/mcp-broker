@@ -15,9 +15,10 @@ import contextlib
 import json
 import logging
 import re
+from base64 import b64decode
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -40,6 +41,80 @@ RATE_LIMIT_RETRY_CAP_SECONDS = 30
 # LinkedIn daily quotas have long retry windows -- don't wait, just fail fast
 DAILY_QUOTA_THRESHOLD_SECONDS = 300
 
+# Media uploads are larger than the JSON calls; the 5s httpx default is too tight.
+MEDIA_UPLOAD_TIMEOUT_SECONDS = 60.0
+# Byte ceilings enforced before the upload PUT. LinkedIn's documented maxima:
+# images have no published MB cap (only a pixel ceiling) -- 10 MB is a safe practical
+# bound; documents (which render as a swipeable carousel) allow up to 100 MB / 300 pages.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+# Base64 inflates bytes by ~4/3. _decode_media rejects an over-long encoded string before
+# decoding it (OOM defence -- mirrors the notion_api upload_file tool); the same ceiling is
+# surfaced as the schema maxLength, which is advisory only -- the broker does not validate
+# inputs against it. Ceil-divide the byte cap by 3, then multiply by 4.
+_MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
+_MAX_DOCUMENT_BASE64_CHARS = -(-MAX_DOCUMENT_BYTES // 3) * 4
+
+# initializeUpload returns the URL the media bytes are PUT to with the access token
+# attached, so that URL is restricted to LinkedIn's own domains (see _validate_upload_url).
+_UPLOAD_HOST_SUFFIXES = (".linkedin.com", ".licdn.com")
+_EXACT_UPLOAD_HOSTS = frozenset({"linkedin.com", "licdn.com"})
+
+# === SCOPES ===
+
+# OAuth scopes requested for every LinkedIn connection. Self-serve products only
+# (Share on LinkedIn + Sign In with OpenID Connect), which is what an app gets
+# without LinkedIn review.
+#
+# To enable the organization tools (get_org_posts, get_managed_orgs,
+# create_comment, react_to_post, get_post_comments, get_org_analytics,
+# get_post_analytics) apply for the Community Management API at
+# developer.linkedin.com, then add the org scopes here:
+#   "r_organization_social", "w_organization_social",
+#   "r_organization_social_feed", "w_organization_social_feed",
+#   "rw_organization_admin"
+_SCOPES = (
+    "openid",
+    "profile",
+    "w_member_social",
+)
+
+# Org tools call /rest/ Community Management endpoints. Without the org scopes
+# above those calls are guaranteed 403s, so we guard the tools on this flag and
+# raise an actionable error instead. Derived from _SCOPES so the gate flips
+# automatically once the org scopes are added.
+_ORG_TOOLS_ENABLED = "r_organization_social" in _SCOPES
+
+# The 7 org-tier tools, gated behind the Community Management scopes. Used by
+# is_tool_available to hide them from tools/list (and reject direct calls) until
+# _ORG_TOOLS_ENABLED flips. Kept in sync with the org tools listed in _SCOPES.
+_ORG_TOOL_NAMES = frozenset(
+    {
+        "get_org_posts",
+        "get_managed_orgs",
+        "create_comment",
+        "react_to_post",
+        "get_post_comments",
+        "get_org_analytics",
+        "get_post_analytics",
+    }
+)
+
+# Raised by org tools when the Community Management scopes are not configured.
+_ORG_TOOLS_DISABLED_ERROR = (
+    "LinkedIn organization tools require the Community Management API "
+    "(r_organization_social scope) -- see src/connectors/linkedin/SETUP.md"
+)
+
+
+def _require_org_tools() -> None:
+    """Guard org-only tools. Raises a clear error before any HTTP call when the
+    Community Management scopes are not configured (the calls would 403 anyway).
+    """
+    if not _ORG_TOOLS_ENABLED:
+        raise ValueError(_ORG_TOOLS_DISABLED_ERROR)
+
+
 # === INPUT VALIDATION ===
 
 # URN regexes prevent path traversal in URL construction
@@ -59,6 +134,48 @@ def _validate_org_id(org_id: str) -> None:
     """Validate numeric organization ID. Prevents path traversal in URL construction."""
     if not _ORG_ID_RE.match(org_id):
         raise ValueError(f"Invalid organization ID: {org_id!r}")
+
+
+def _decode_media(media_base64: str, max_bytes: int, label: str) -> bytes:
+    """Decode base64 media and enforce the size ceiling BEFORE any HTTP call.
+
+    The schema's maxLength is advisory -- the broker does not validate inputs against it
+    (native.py passes raw arguments straight to the handler) -- so the real gate is here:
+    reject an over-long encoded string before decoding (so an oversized payload is never
+    expanded ~4/3 in memory), then re-check the decoded byte length.
+    """
+    # base64 inflates ~4/3, so bound the encoded length first (ceil(max_bytes / 3) * 4).
+    if len(media_base64) > -(-max_bytes // 3) * 4:
+        raise ValueError(f"The {label} exceeds the upload limit of {max_bytes} bytes")
+    try:
+        raw_bytes = b64decode(media_base64, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(f"The {label} is not valid base64") from exc
+    if not raw_bytes:
+        raise ValueError(f"The {label} is empty")
+    if len(raw_bytes) > max_bytes:
+        raise ValueError(
+            f"The {label} is {len(raw_bytes)} bytes; the upload limit is {max_bytes} bytes"
+        )
+    return raw_bytes
+
+
+def _validate_upload_url(url: str) -> None:
+    """Guard the media-upload PUT, which carries the live access token.
+
+    initializeUpload returns the URL the bytes are PUT to with the token in the
+    Authorization header. Restrict it to HTTPS on a LinkedIn-owned host so a
+    malformed or compromised initializeUpload response can't redirect the token to
+    an attacker-controlled or internal address (SSRF + token leak). Allowlisting
+    LinkedIn's domains is stricter than rejecting only private IPs -- nothing
+    outside them is accepted, raw-IP hosts included.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https":
+        raise ValueError("LinkedIn upload URL must use HTTPS")
+    if host not in _EXACT_UPLOAD_HOSTS and not host.endswith(_UPLOAD_HOST_SUFFIXES):
+        raise ValueError(f"Unexpected LinkedIn upload host: {host!r}")
 
 
 # === SERIALIZATION HELPERS ===
@@ -159,6 +276,16 @@ def _extract_org_id_from_urn(org_urn: str) -> str:
 # === ASYNC API HELPERS ===
 
 
+class _SessionError(ValueError):
+    """A failure that invalidates the whole session, not just one resource.
+
+    Raised for token expiry (401) and exhausted rate limits. Subclasses
+    ValueError so existing `except ValueError` handlers keep working, but lets
+    per-resource degradation loops (e.g. _batch_fetch_orgs) re-raise it instead
+    of masking token expiry as a missing name.
+    """
+
+
 def _build_headers(access_token: str, *, versioned: bool = True) -> dict[str, str]:
     """Build headers for LinkedIn API requests.
 
@@ -177,7 +304,7 @@ def _build_headers(access_token: str, *, versioned: bool = True) -> dict[str, st
 def _check_status(response: httpx.Response) -> None:
     """Check response for auth and permission errors. Raises with sanitized messages."""
     if response.status_code == 401:  # noqa: PLR2004 -- HTTP status code
-        raise ValueError(
+        raise _SessionError(
             "LinkedIn token expired or revoked -- reconnect via /oauth/linkedin/connect"
         )
     if response.status_code == 403:  # noqa: PLR2004 -- HTTP status code
@@ -201,13 +328,21 @@ def _check_status(response: httpx.Response) -> None:
 async def _handle_response(
     response: httpx.Response,
     retry_fn: Callable[[], Awaitable[httpx.Response]],
+    *,
+    idempotent: bool = True,
 ) -> httpx.Response:
     """Handle rate limiting and status checking in correct order.
 
-    Bug fix: _check_status must NOT run before retry logic, because it raises
-    on 429 and would prevent the retry from ever executing.
+    _check_status must NOT run before retry logic, because it raises on 429
+    and would prevent the retry from ever executing.
+
+    idempotent=False (POST creates): never retry. Re-issuing a create after a
+    429 risks a double-post / double-comment, so we surface the rate limit
+    immediately instead.
     """
     if response.status_code == 429:  # noqa: PLR2004 -- HTTP status code
+        if not idempotent:
+            raise _SessionError("Rate limited by LinkedIn -- try again later")
         return await _retry_on_rate_limit(response, retry_fn)
     _check_status(response)
     return response
@@ -227,13 +362,13 @@ async def _retry_on_rate_limit(
     except (ValueError, TypeError):
         retry_after = 5.0  # HTTP spec allows date format — fall back to safe default
     if retry_after > DAILY_QUOTA_THRESHOLD_SECONDS:
-        raise ValueError("LinkedIn daily quota exceeded -- try again tomorrow")
+        raise _SessionError("LinkedIn daily quota exceeded -- try again tomorrow")
     capped = min(retry_after, RATE_LIMIT_RETRY_CAP_SECONDS)
     logger.warning("[LinkedIn] Rate limited, retrying after %.1fs", capped)
     await asyncio.sleep(capped)
     retry_response = await request_fn()
     if retry_response.status_code == 429:  # noqa: PLR2004 -- HTTP status code
-        raise ValueError("Rate limited by LinkedIn after retry -- try again later")
+        raise _SessionError("Rate limited by LinkedIn after retry -- try again later")
     _check_status(retry_response)
     return retry_response
 
@@ -277,9 +412,12 @@ async def _linkedin_post(  # noqa: PLR0913 -- all params required
             json=json_body,
             params=extra_params,
         )
+        # idempotent=False -- POST creates are not retried; the retry_fn is never
+        # invoked but the signature still requires a callable.
         response = await _handle_response(
             response,
             lambda: client.post(url, headers=headers, json=json_body, params=extra_params),
+            idempotent=False,
         )
         if response.content:
             return response.json()
@@ -343,6 +481,90 @@ _CREATE_POST_META = NativeToolMeta(
             },
         },
         "required": ["text"],
+    },
+)
+
+_CREATE_IMAGE_POST_META = NativeToolMeta(
+    name="create_image_post",
+    description=(
+        "Create a LinkedIn post with an attached image, as the authenticated member "
+        "or a managed organization. The image is supplied as base64-encoded bytes "
+        "(PNG/JPG/GIF). If author_urn is omitted, posts as the authenticated member. "
+        "Text max 3000 chars."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Post text content (max 3000 chars)",
+            },
+            "image_base64": {
+                "type": "string",
+                "description": "Base64-encoded image bytes (PNG/JPG/GIF, up to 10 MB).",
+                "maxLength": _MAX_IMAGE_BASE64_CHARS,
+            },
+            "alt_text": {
+                "type": "string",
+                "description": "Alternative text describing the image, for accessibility (optional).",
+            },
+            "author_urn": {
+                "type": "string",
+                "description": (
+                    "URN of the author -- urn:li:person:{id} or urn:li:organization:{id}. "
+                    "Defaults to the authenticated member if omitted."
+                ),
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["PUBLIC", "CONNECTIONS"],
+                "description": "Post visibility (default: PUBLIC)",
+                "default": "PUBLIC",
+            },
+        },
+        "required": ["text", "image_base64"],
+    },
+)
+
+_CREATE_DOCUMENT_POST_META = NativeToolMeta(
+    name="create_document_post",
+    description=(
+        "Create a LinkedIn post with an attached document (PDF/PPTX/DOCX), as the "
+        "authenticated member or a managed organization. A multi-page document renders "
+        "as a swipeable carousel in the feed. The document is supplied as base64-encoded "
+        "bytes. If author_urn is omitted, posts as the authenticated member. Text max 3000 chars."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Post text content (max 3000 chars)",
+            },
+            "document_base64": {
+                "type": "string",
+                "description": "Base64-encoded document bytes (PDF/PPT/PPTX/DOC/DOCX, up to 100 MB).",
+                "maxLength": _MAX_DOCUMENT_BASE64_CHARS,
+            },
+            "title": {
+                "type": "string",
+                "description": "Document title shown on the carousel (required).",
+            },
+            "author_urn": {
+                "type": "string",
+                "description": (
+                    "URN of the author -- urn:li:person:{id} or urn:li:organization:{id}. "
+                    "Defaults to the authenticated member if omitted."
+                ),
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["PUBLIC", "CONNECTIONS"],
+                "description": "Post visibility (default: PUBLIC)",
+                "default": "PUBLIC",
+            },
+        },
+        "required": ["text", "document_base64", "title"],
     },
 )
 
@@ -532,31 +754,12 @@ class LinkedInConnector(NativeConnector):
         display_name="LinkedIn",
         oauth_authorize_url="https://www.linkedin.com/oauth/v2/authorization",
         oauth_token_url="https://www.linkedin.com/oauth/v2/accessToken",  # noqa: S106 -- endpoint URL, not a password
-        # Self-serve scopes only (Share on LinkedIn + Sign In).
-        # Add org scopes after Community Management API approval:
-        #   "r_organization_social", "w_organization_social",
-        #   "r_organization_social_feed", "w_organization_social_feed",
-        #   "rw_organization_admin",
-        scopes=[
-            "openid",
-            "profile",
-            "w_member_social",
-        ],
+        scopes=_SCOPES,
         supports_pkce=False,  # LinkedIn's standard OAuth flow rejects code_verifier
     )
 
     # No build_token_request_auth override — LinkedIn uses client_secret_post
     # (client_id + client_secret in POST body), which is the broker default.
-
-    @property
-    def _use_rest_api(self) -> bool:
-        """Whether Community Management API scopes are configured.
-
-        Determines which API to use:
-        - True: /rest/ versioned endpoints (Community Management API)
-        - False: /v2/ legacy endpoints (Share on LinkedIn product)
-        """
-        return "r_organization_social" in self.meta.scopes
 
     # --- MCP tools ---
 
@@ -579,10 +782,68 @@ class LinkedInConnector(NativeConnector):
         if len(text) > MAX_POST_LENGTH:
             raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
         resolved_urn = await _resolve_author_urn(access_token, author_urn)
-        if self._use_rest_api:
+        # /rest/ posting (org tier) is only reachable with the Community Management
+        # scopes; without them the v2 Share-on-LinkedIn path is the only one that works.
+        if _ORG_TOOLS_ENABLED:
             created = await _create_post_rest(access_token, resolved_urn, text, visibility)
         else:
             created = await _create_post_v2(access_token, resolved_urn, text, visibility)
+        return _mcp_text_content(created)
+
+    @native_tool(_CREATE_IMAGE_POST_META)
+    async def create_image_post(  # noqa: PLR0913 -- MCP tool signature
+        self,
+        *,
+        access_token: str,
+        text: str,
+        image_base64: str,
+        alt_text: str = "",
+        author_urn: str = "",
+        visibility: str = "PUBLIC",
+    ) -> list[dict[str, Any]]:
+        """Create a post with an attached image (member or managed org author).
+
+        Image/document posts always use the versioned /rest/ media flow -- it is the
+        only path that supports documents, and the docs confirm member-owned uploads
+        work with the self-serve w_member_social scope.
+        """
+        if len(text) > MAX_POST_LENGTH:
+            raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
+        raw_bytes = _decode_media(image_base64, MAX_IMAGE_BYTES, "image")
+        author = await _resolve_author_urn(access_token, author_urn)
+        media_attrs = {"altText": alt_text} if alt_text else {}
+        created = await _create_media_post(
+            access_token, author, text, visibility, "images", raw_bytes, media_attrs=media_attrs
+        )
+        return _mcp_text_content(created)
+
+    @native_tool(_CREATE_DOCUMENT_POST_META)
+    async def create_document_post(  # noqa: PLR0913 -- MCP tool signature
+        self,
+        *,
+        access_token: str,
+        text: str,
+        document_base64: str,
+        title: str = "",
+        author_urn: str = "",
+        visibility: str = "PUBLIC",
+    ) -> list[dict[str, Any]]:
+        """Create a post with an attached document; a multi-page doc renders as a carousel."""
+        if len(text) > MAX_POST_LENGTH:
+            raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
+        if not title:
+            raise ValueError("A document title is required")
+        raw_bytes = _decode_media(document_base64, MAX_DOCUMENT_BYTES, "document")
+        author = await _resolve_author_urn(access_token, author_urn)
+        created = await _create_media_post(
+            access_token,
+            author,
+            text,
+            visibility,
+            "documents",
+            raw_bytes,
+            media_attrs={"title": title},
+        )
         return _mcp_text_content(created)
 
     @native_tool(_DELETE_POST_META)
@@ -590,7 +851,9 @@ class LinkedInConnector(NativeConnector):
         """Delete a LinkedIn post by URN."""
         _validate_post_urn(post_urn)
         encoded_urn = quote(post_urn, safe="")
-        if self._use_rest_api:
+        # /rest/ deletion (org tier) requires the Community Management scopes;
+        # otherwise delete via the v2 Share-on-LinkedIn path.
+        if _ORG_TOOLS_ENABLED:
             await _linkedin_delete(access_token, f"/rest/posts/{encoded_urn}")
         else:
             await _linkedin_delete(access_token, f"/v2/ugcPosts/{encoded_urn}", versioned=False)
@@ -605,6 +868,7 @@ class LinkedInConnector(NativeConnector):
         count: int = DEFAULT_LIMIT,
     ) -> list[dict[str, Any]]:
         """Get recent posts for a LinkedIn organization page."""
+        _require_org_tools()
         _validate_org_id(org_id)
         clamped = _clamp_limit(count)
         org_urn = f"urn:li:organization:{org_id}"
@@ -629,6 +893,7 @@ class LinkedInConnector(NativeConnector):
         The /rest/ API doesn't support Rest.li v1 projections (~dereference),
         so we make a follow-up call to /rest/organizations for names.
         """
+        _require_org_tools()
         acl_response = await _linkedin_get(
             access_token,
             "/rest/organizationAcls",
@@ -654,8 +919,10 @@ class LinkedInConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Add a comment to a LinkedIn post.
 
-        # socialActions endpoint on deprecation path -- monitor Linkedin-Version updates
+        Note: the socialActions endpoint is on a deprecation path -- monitor
+        Linkedin-Version updates.
         """
+        _require_org_tools()
         _validate_post_urn(post_urn)
         if len(text) > MAX_COMMENT_LENGTH:
             raise ValueError(f"Comment exceeds {MAX_COMMENT_LENGTH} characters ({len(text)} given)")
@@ -679,6 +946,7 @@ class LinkedInConnector(NativeConnector):
         reaction_type: str,
     ) -> list[dict[str, Any]]:
         """React to a LinkedIn post."""
+        _require_org_tools()
         _validate_post_urn(post_urn)
         person_urn = await _get_person_urn(access_token)
         body = {
@@ -704,18 +972,22 @@ class LinkedInConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Get comments on a LinkedIn post.
 
-        # socialActions endpoint on deprecation path -- monitor Linkedin-Version updates
+        Note: the socialActions endpoint is on a deprecation path -- monitor
+        Linkedin-Version updates.
         """
+        _require_org_tools()
         _validate_post_urn(post_urn)
         clamped = _clamp_limit(count)
         encoded_urn = quote(post_urn, safe="")
+        # X-RestLi-Method: FINDER required for finder requests on /rest/ endpoints
         response = await _linkedin_get(
             access_token,
             f"/rest/socialActions/{encoded_urn}/comments",
+            restli_method="FINDER",
             count=clamped,
         )
         elements = response.get("elements", [])
-        comments = [_simplify_comment(c) for c in elements]
+        comments = [_simplify_comment(comment) for comment in elements]
         return _mcp_text_content(comments)
 
     @native_tool(_GET_ORG_ANALYTICS_META)
@@ -730,6 +1002,7 @@ class LinkedInConnector(NativeConnector):
 
         The period param is metadata-only -- LinkedIn returns lifetime stats.
         """
+        _require_org_tools()
         _validate_org_id(org_id)
         org_urn = f"urn:li:organization:{org_id}"
         follower_stats, page_stats = await _fetch_org_analytics(access_token, org_urn, period)
@@ -750,6 +1023,7 @@ class LinkedInConnector(NativeConnector):
         post_urns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get impression and engagement stats for org posts."""
+        _require_org_tools()
         _validate_org_id(org_id)
         org_urn = f"urn:li:organization:{org_id}"
         params: dict[str, Any] = {"q": "organizationalEntity", "organizationalEntity": org_urn}
@@ -763,6 +1037,21 @@ class LinkedInConnector(NativeConnector):
         )
         stats = [_simplify_share_stats(el) for el in response.get("elements", [])]
         return _mcp_text_content({"org_id": org_id, "post_stats": stats})
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Hide the 7 org-tier tools from tools/list until the Community
+        Management scopes are configured.
+
+        Without the org scopes those tools are guaranteed 403s, so advertising
+        them to the LLM only invites doomed calls. Returning False here filters
+        them out of tools/list and makes the dispatcher reject direct calls with
+        the unknown-tool error. The per-tool _require_org_tools() call-time guard
+        stays in place as defense in depth -- if a tool's availability and its
+        guard ever drift, the guard still blocks the actual HTTP request.
+        """
+        if not _ORG_TOOLS_ENABLED and tool_name in _ORG_TOOL_NAMES:
+            return False
+        return super().is_tool_available(tool_name)
 
     @classmethod
     def tool_prompt_instructions(cls) -> str:
@@ -785,25 +1074,90 @@ class LinkedInConnector(NativeConnector):
 # --- Private helpers (module-level to keep connector body short) ---
 
 
+def _rest_post_body(
+    author_urn: str, text: str, visibility: str, *, media: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build a /rest/posts request body, optionally carrying an attached media reference."""
+    body: dict[str, Any] = {
+        "author": author_urn,
+        "commentary": text,
+        "visibility": visibility,
+        "distribution": {
+            "feedDistribution": "MAIN_FEED",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": [],
+        },
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": False,
+    }
+    if media is not None:
+        body["content"] = {"media": media}
+    return body
+
+
 async def _create_post_rest(
     access_token: str, author_urn: str, text: str, visibility: str
 ) -> dict[str, Any]:
     """Create post via /rest/posts (Community Management API, versioned)."""
     return await _linkedin_post(
+        access_token, "/rest/posts", _rest_post_body(author_urn, text, visibility)
+    )
+
+
+async def _initialize_media_upload(
+    access_token: str, collection: str, owner_urn: str
+) -> tuple[str, str]:
+    """Initialize a versioned media upload. Returns (upload_url, media_urn).
+
+    collection is the /rest/ resource ('images' or 'documents'); the returned URN
+    keys off its singular form ('image' / 'document') and is referenced in the post.
+    """
+    response = await _linkedin_post(
         access_token,
-        "/rest/posts",
-        {
-            "author": author_urn,
-            "commentary": text,
-            "visibility": visibility,
-            "distribution": {
-                "feedDistribution": "MAIN_FEED",
-                "targetEntities": [],
-                "thirdPartyDistributionChannels": [],
-            },
-            "lifecycleState": "PUBLISHED",
-            "isReshareDisabledByAuthor": False,
-        },
+        f"/rest/{collection}",
+        {"initializeUploadRequest": {"owner": owner_urn}},
+        extra_params={"action": "initializeUpload"},
+    )
+    value = response.get("value", {})
+    upload_url = value.get("uploadUrl")
+    media_urn = value.get(collection[:-1])  # 'images' -> 'image', 'documents' -> 'document'
+    if not upload_url or not media_urn:
+        raise ValueError("LinkedIn did not return a media upload URL or asset URN")
+    return upload_url, media_urn
+
+
+async def _upload_media_binary(access_token: str, upload_url: str, raw_bytes: bytes) -> None:
+    """PUT raw media bytes to the pre-signed LinkedIn upload URL from initializeUpload.
+
+    The upload URL is a LinkedIn media host, not a /rest/ resource, so it takes the
+    Bearer token but no Linkedin-Version header.
+    """
+    _validate_upload_url(upload_url)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/octet-stream",
+    }
+    async with httpx.AsyncClient(timeout=MEDIA_UPLOAD_TIMEOUT_SECONDS) as client:
+        response = await client.put(upload_url, headers=headers, content=raw_bytes)
+        _check_status(response)
+
+
+async def _create_media_post(  # noqa: PLR0913 -- carries the full post + media payload
+    access_token: str,
+    author_urn: str,
+    text: str,
+    visibility: str,
+    collection: str,
+    raw_bytes: bytes,
+    *,
+    media_attrs: dict[str, Any],
+) -> dict[str, Any]:
+    """Upload media then create a /rest/posts post referencing it (versioned flow)."""
+    upload_url, media_urn = await _initialize_media_upload(access_token, collection, author_urn)
+    await _upload_media_binary(access_token, upload_url, raw_bytes)
+    media = {"id": media_urn, **media_attrs}
+    return await _linkedin_post(
+        access_token, "/rest/posts", _rest_post_body(author_urn, text, visibility, media=media)
     )
 
 
@@ -879,13 +1233,21 @@ def _extract_org_ids_from_acls(elements: list[dict[str, Any]]) -> list[str]:
 
     ACL elements use 'organization' or 'organizationTarget' depending on
     the response format -- handle both.
+
+    Each extracted ID is validated against _ORG_ID_RE before use. The ID comes
+    from LinkedIn's response but is interpolated into a URL path downstream
+    (/rest/organizations/{id}); a malformed URN like
+    urn:li:organization:123/../evil would otherwise inject path segments.
     """
     org_ids: list[str] = []
     seen: set[str] = set()
     for acl in elements:
         org_urn = acl.get("organizationTarget") or acl.get("organization", "")
         org_id = _extract_org_id_from_urn(org_urn)
-        if org_id and org_id not in seen:
+        if not _ORG_ID_RE.match(org_id):
+            logger.debug("[LinkedIn] Skipping malformed org URN in ACLs: %r", org_urn)
+            continue
+        if org_id not in seen:
             seen.add(org_id)
             org_ids.append(org_id)
     return org_ids
@@ -903,6 +1265,10 @@ async def _batch_fetch_orgs(
     for org_id in org_ids:
         try:
             raw = await _linkedin_get(access_token, f"/rest/organizations/{org_id}")
+        except _SessionError:
+            # Token expiry / exhausted rate limit affects every org -- surface it
+            # instead of silently degrading each row to a missing name.
+            raise
         except ValueError:
             # Graceful degradation -- return URN even if name lookup fails
             orgs.append(

@@ -11,6 +11,7 @@ in __init_subclass__, dispatch via handler lookup.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -42,6 +43,10 @@ class _RegisteredTool(BaseModel):
 
     meta: NativeToolMeta
     handler_name: str
+    # Whether the handler declares a `provider_metadata` parameter. Detected once at
+    # registration so dispatch only forwards metadata to handlers that opted in —
+    # handlers without it (e.g. every Twitter tool) keep their original signature.
+    accepts_metadata: bool = False
     model_config = ConfigDict(frozen=True)
 
 
@@ -66,7 +71,14 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict:
 
 
 def native_tool(meta: NativeToolMeta) -> Callable:
-    """Mark a method as a native MCP tool. Collected by __init_subclass__."""
+    """Mark a method as a native MCP tool. Collected by __init_subclass__.
+
+    MUST return the handler unwrapped (or, if ever wrapped, set ``__wrapped__``):
+    __init_subclass__ uses ``inspect.signature`` on the handler to detect whether
+    it opts into ``provider_metadata``. A wrapper without ``__wrapped__`` would hide
+    the real signature and silently stop metadata (e.g. QuickBooks' realmId) from
+    being forwarded.
+    """
 
     def decorator(fn: Any) -> Any:
         fn._tool_meta = meta
@@ -105,20 +117,50 @@ class NativeConnector(BaseConnector):
                 cls._tools[tool_meta.name] = _RegisteredTool(
                     meta=tool_meta,
                     handler_name=attr_name,
+                    accepts_metadata="provider_metadata" in inspect.signature(method).parameters,
                 )
         super().__init_subclass__(**kwargs)
 
+    # --- Tool availability ---
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Whether a registered tool should be exposed on this request.
+
+        Defaults to True -- every registered tool is available. Connectors whose
+        tool tiers depend on granted OAuth scopes override this to return False
+        for tools the current connection cannot use, so those tools never reach
+        the LLM's tool menu via tools/list (and calling them is rejected exactly
+        like an unknown tool). The default keeps existing connectors unchanged.
+        """
+        return True
+
     # --- MCP JSON-RPC dispatch ---
 
-    async def handle_mcp_request(
+    async def handle_mcp_request(  # noqa: PLR0913 -- MCP dispatch needs method/params/request_id/token/metadata
         self,
         *,
         method: str,
         params: dict,
         request_id: Any,
         access_token: str,
-    ) -> dict:
-        """Handle an MCP JSON-RPC request. Token passed directly as argument."""
+        provider_metadata: dict[str, str] | None = None,
+    ) -> dict | None:
+        """Handle an MCP JSON-RPC request. Token passed directly as argument.
+
+        ``provider_metadata`` carries non-secret per-connection identifiers (e.g.
+        QuickBooks' realmId) captured at OAuth-callback time; it is forwarded only
+        to tool handlers that declare a ``provider_metadata`` parameter.
+
+        Returns None when the payload is a JSON-RPC notification (no ``id``):
+        the spec mandates that notifications receive NO response, so the caller
+        replies 204 with an empty body rather than emitting an error.
+        """
+        # JSON-RPC notifications carry no id. They MUST NOT get a response body —
+        # not even an error — so allowlisted notifications (initialized/cancelled
+        # are no-ops) are acknowledged with None and the caller returns 204.
+        if request_id is None:
+            return None
+
         match method:
             case "initialize":
                 return _jsonrpc_ok(
@@ -129,8 +171,6 @@ class NativeConnector(BaseConnector):
                         "serverInfo": {"name": self.meta.name, "version": "1.0.0"},
                     },
                 )
-            case "notifications/initialized":
-                return {}  # Empty dict signals "no response" — caller returns 204
             case "tools/list":
                 return _jsonrpc_ok(
                     request_id,
@@ -142,11 +182,14 @@ class NativeConnector(BaseConnector):
                                 "inputSchema": tool.meta.input_schema,
                             }
                             for tool in self._tools.values()
+                            if self.is_tool_available(tool.meta.name)
                         ],
                     },
                 )
             case "tools/call":
-                return await _dispatch_tool(self, params, request_id, access_token)
+                return await _dispatch_tool(
+                    self, params, request_id, access_token, provider_metadata
+                )
             case "ping":
                 return _jsonrpc_ok(request_id, {})
             case _:
@@ -156,11 +199,12 @@ class NativeConnector(BaseConnector):
 # --- Tool dispatch (module-level to keep NativeConnector body short) ---
 
 
-async def _dispatch_tool(
+async def _dispatch_tool(  # noqa: PLR0913 -- dispatch needs connector/params/request_id/token/metadata
     connector: NativeConnector,
     params: dict,
     request_id: Any,
     access_token: str,
+    provider_metadata: dict[str, str] | None = None,
 ) -> dict:
     """Look up and execute a registered tool by name."""
     if not isinstance(params, dict):
@@ -171,21 +215,48 @@ async def _dispatch_tool(
 
     if not isinstance(arguments, dict):
         return _jsonrpc_error(request_id, -32602, "Tool arguments must be an object")
-    arguments.pop("access_token", None)
+    # Strip broker-injected kwargs (access_token, provider_metadata) from untrusted
+    # client args without mutating the caller's dict — the broker supplies the real
+    # values below, so a spoofed value in arguments must never override them.
+    tool_arguments = {
+        key: value
+        for key, value in arguments.items()
+        if key not in ("access_token", "provider_metadata")
+    }
 
     registered = connector._tools.get(tool_name)
-    if not registered:
+    # An unavailable tool was filtered out of tools/list, so to the client it
+    # never existed. Return the SAME unknown-tool error to keep availability
+    # indistinguishable from nonexistence -- a client that guesses the name
+    # learns nothing about which scope tier is enabled.
+    if not registered or not connector.is_tool_available(tool_name):
         return _jsonrpc_error(request_id, -32602, f"Unknown tool: {tool_name}")
     try:
         handler = getattr(connector, registered.handler_name)
-        content = await handler(access_token=access_token, **arguments)
+        # Forward provider_metadata only to handlers that declared the parameter,
+        # so handlers without it keep their original (access_token-only) signature.
+        metadata_kwarg = (
+            {"provider_metadata": provider_metadata or {}} if registered.accepts_metadata else {}
+        )
+        content = await handler(access_token=access_token, **metadata_kwarg, **tool_arguments)
+    except ValueError as validation_error:
+        # ValueError is the connector-authored, pre-sanitized error channel —
+        # its message is intended for the remote client. Any other exception type
+        # may embed SDK response bodies/URLs/tokens, so only ValueError passes through.
+        logger.exception("[%s] Tool %s failed", connector.meta.name, tool_name)
+        return _tool_error(request_id, str(validation_error))
     except Exception as exc:
         logger.exception("[%s] Tool %s failed", connector.meta.name, tool_name)
-        return _jsonrpc_ok(
-            request_id,
-            {
-                "content": [{"type": "text", "text": str(exc)}],
-                "isError": True,
-            },
-        )
+        return _tool_error(request_id, f"{tool_name} tool failed: {type(exc).__name__}")
     return _jsonrpc_ok(request_id, {"content": content})
+
+
+def _tool_error(request_id: Any, message: str) -> dict:
+    """Build a tools/call result marked isError with a single text content block."""
+    return _jsonrpc_ok(
+        request_id,
+        {
+            "content": [{"type": "text", "text": message}],
+            "isError": True,
+        },
+    )

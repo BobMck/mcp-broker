@@ -23,8 +23,13 @@ _DOCKER_SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-
 
 
 def _is_internal_url(url: str) -> bool:
-    """Return True for Docker service names and localhost (dev)."""
-    hostname = urlparse(url).hostname or ""
+    """Return True for Docker service names and localhost (dev).
+
+    The dot-free hostname allowance encodes the Docker-service-name convention
+    (e.g. ``workspace-mcp``) and applies only to code-reviewed ``ConnectorMeta``
+    constants — it is NOT a guard against untrusted input.
+    """
+    hostname = (urlparse(url).hostname or "").lower()
     if hostname == "localhost":
         return True
     return bool(_DOCKER_SERVICE_NAME_PATTERN.match(hostname))
@@ -53,11 +58,13 @@ class ConnectorMeta(BaseModel):
         ),
     )
     mcp_transport: str = "streamable_http"
-    auth_mode: Literal["broker", "sidecar"] = Field(
+    auth_mode: Literal["broker", "sidecar", "none"] = Field(
         default="broker",
         description=(
             "'broker' = broker manages OAuth (default). "
-            "'sidecar' = sidecar manages its own credentials, broker proxies without token injection."
+            "'sidecar' = sidecar manages its own credentials, broker proxies without token injection. "
+            "'none' = no broker-issued token; the connector targets an open or static-token API and "
+            "self-sources any credential from its own config (skips the OAuth connection gate)."
         ),
     )
     oauth_authorize_url: str | None = Field(
@@ -67,7 +74,10 @@ class ConnectorMeta(BaseModel):
         default=None,
         description="OAuth token exchange endpoint (required when auth_mode='broker')",
     )
-    scopes: list[str] = Field(default_factory=list, description="OAuth scopes to request")
+    # Tuple, not list: ConnectorMeta is frozen, but frozen does not freeze list
+    # contents — a list would let scopes (which feed the authorize URL) be
+    # mutated by reference. Pydantic coerces the list literals in adapters.
+    scopes: tuple[str, ...] = Field(default=(), description="OAuth scopes to request")
     supports_pkce: bool = Field(
         default=True,
         description="Whether the OAuth provider supports PKCE (S256). Default True per OAuth 2.1 spec.",
@@ -123,6 +133,12 @@ class ConnectorMeta(BaseModel):
         ):
             raise ValueError(f"mcp_url must use HTTPS for external URLs: {self.mcp_url}")
 
+        # Discovery base URL is fetched at startup to resolve OAuth endpoints —
+        # SSRF defence requires it to be HTTPS (no Docker-internal exemption: the
+        # remote auth server lives on the public internet).
+        if self.mcp_oauth_url and not self.mcp_oauth_url.startswith("https://"):
+            raise ValueError(f"mcp_oauth_url must use HTTPS: {self.mcp_oauth_url}")
+
         return self
 
     @property
@@ -134,6 +150,15 @@ class ConnectorMeta(BaseModel):
     def is_sidecar_managed(self) -> bool:
         """Whether the sidecar manages its own auth (broker proxies without token injection)."""
         return self.auth_mode == "sidecar"
+
+    @property
+    def requires_oauth(self) -> bool:
+        """Whether the broker must obtain/inject an OAuth token for this connector.
+
+        False for auth_mode='none' (open or static-token APIs that self-source any
+        credential) and 'sidecar' — both skip the broker's OAuth connection gate.
+        """
+        return self.auth_mode == "broker"
 
     @property
     def uses_discovery(self) -> bool:
