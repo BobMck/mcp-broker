@@ -282,12 +282,16 @@ def _open_browser(url: str) -> None:
         print(f"{logger_prefix}Refusing to open non-HTTP URL: {url}")
         return
 
-    if sys.platform == "darwin":
-        subprocess.run(["open", url], check=False)  # noqa: S603, S607 — trusted CLI opening validated URL
-    elif sys.platform == "linux":
-        subprocess.run(["xdg-open", url], check=False)  # noqa: S603, S607 — trusted CLI opening validated URL
-    else:
+    opener = {"darwin": "open", "linux": "xdg-open"}.get(sys.platform)
+    if opener is None:
         print(f"{logger_prefix}Open this URL manually:\n{logger_prefix}{url}")
+        return
+    try:
+        subprocess.run([opener, url], check=False)  # noqa: S603, S607 — trusted CLI opening validated URL
+    except FileNotFoundError:
+        # Headless host (no browser opener, e.g. a server container). The caller
+        # prints the URL immediately after this returns, so connection can proceed.
+        print(f"{logger_prefix}No browser opener found — open this URL manually:\n{logger_prefix}{url}")
 
 
 def _poll_until_connected(

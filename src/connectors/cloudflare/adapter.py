@@ -39,7 +39,9 @@ class CloudflareConnector(BaseConnector):
         # the double-segment `/mcp/mcp` and 404 from Cloudflare.
         mcp_url=_CF_BASE,
         mcp_transport="streamable_http",
-        # Static URLs kept for documentation — ignored when mcp_oauth_url is set.
+        # Static URLs are ignored at runtime for endpoint routing (the discovered
+        # endpoints are used) but are still REQUIRED by the ConnectorMeta validator
+        # for auth_mode="broker" — removing them raises ValueError at startup.
         oauth_authorize_url=f"{_CF_BASE}/authorize",
         oauth_token_url=f"{_CF_BASE}/token",  # noqa: S106 — endpoint URL, not a password
         scopes=(),

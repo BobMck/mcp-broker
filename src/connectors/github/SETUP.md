@@ -32,7 +32,8 @@ No privileged scopes beyond these are requested.
 
 ## Broker Configuration
 
-1. Add credentials to `.env`:
+1. Add credentials to `.env` (or, in a templated deployment, to `.env.j2`
+   / sourced from a secrets manager — do not commit real values):
    ```
    GITHUB_CLIENT_ID=...
    GITHUB_CLIENT_SECRET=...
