@@ -5,7 +5,10 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "8002:8002"
+      # Localhost only: cloudflared (the sole intended client) connects via
+      # 127.0.0.1, and the broker/admin API must not listen on the public IP
+      # or the tailnet. Admin access from the Mac: ssh -L 8002:localhost:8002.
+      - "127.0.0.1:8002:8002"
     volumes:
       - ./data:/app/data
       - ./settings.yaml:/app/settings.yaml:ro
