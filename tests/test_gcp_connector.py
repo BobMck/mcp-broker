@@ -65,6 +65,9 @@ def _token_response() -> FakeResponse:
 @pytest.fixture
 def connector():
     instance = ConnectorRegistry.get("gcp")
+    if instance is None:  # another test module cleared the registry
+        ConnectorRegistry.auto_register(gcp_adapter.GcpConnector)
+        instance = ConnectorRegistry.get("gcp")
     assert instance is not None
     return instance
 

@@ -63,6 +63,9 @@ def _token_response() -> FakeResponse:
 @pytest.fixture
 def connector():
     instance = ConnectorRegistry.get("tailscale")
+    if instance is None:  # another test module cleared the registry
+        ConnectorRegistry.auto_register(ts_adapter.TailscaleConnector)
+        instance = ConnectorRegistry.get("tailscale")
     assert instance is not None
     return instance
 

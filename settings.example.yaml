@@ -8,6 +8,8 @@ broker:
     - notion_api
     - slack
     - workspace_mcp
+    - gcp        # Native, auth_mode=none — GCE metadata credential (see src/connectors/gcp/SETUP.md)
+    - tailscale  # Native, auth_mode=none — scoped OAuth client (see src/connectors/tailscale/SETUP.md)
   admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
   encryption_keys:
     - ${BROKER_ENCRYPTION_KEY}
