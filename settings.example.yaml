@@ -10,6 +10,7 @@ broker:
     - workspace_mcp
     - gcp        # Native, auth_mode=none — GCE metadata credential (see src/connectors/gcp/SETUP.md)
     - tailscale  # Native, auth_mode=none — scoped OAuth client (see src/connectors/tailscale/SETUP.md)
+    - gitlab     # Native, auth_mode=none — read_api PAT via GITLAB_TOKEN (see src/connectors/gitlab/SETUP.md)
   admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
   encryption_keys:
     - ${BROKER_ENCRYPTION_KEY}
