@@ -33,6 +33,7 @@ from broker.config import BrokerSettings, FirestoreStoreConfig, load_settings
 from broker.connectors.base import BaseConnector
 from broker.connectors.native import NativeConnector
 from broker.connectors.registry import ConnectorRegistry
+from broker.middleware.admin_guard import AdminTunnelGuardMiddleware
 from broker.middleware.auth import BrokerAuthMiddleware
 from broker.models.connection import AppConnection
 from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
@@ -482,6 +483,12 @@ app.add_middleware(
     get_inbound_auth_store=_get_inbound_auth_store,
     get_connector_names=ConnectorRegistry.list_names,
 )
+
+# Admin tunnel guard — registered LAST so it runs OUTERMOST: /admin requests that
+# arrived through the Cloudflare tunnel are 404'd before any other layer sees
+# them. The admin plane is local-only (ssh -L over Tailscale); this keeps the
+# internet-facing tunnel from re-exposing /admin. See admin_guard.py.
+app.add_middleware(AdminTunnelGuardMiddleware)
 
 
 # =============================================================================
