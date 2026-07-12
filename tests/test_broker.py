@@ -375,6 +375,57 @@ class TestOAuthHandler:
         assert "state" in params
         assert params["scope"] == ["read write"]
 
+    async def test_build_authorize_url_uses_per_app_scope_override(
+        self, oauth_handler: OAuthHandler, test_meta: ConnectorMeta
+    ) -> None:
+        """A per-app `scopes` override wins over connector.meta.scopes in the authorize URL.
+
+        This is how my_company:grok requests read-only GitHub while my_company:app1
+        keeps the connector default (full repo). The requested scope is what bounds
+        the resulting token, so this is the security-load-bearing assertion.
+        """
+
+        class TestConn(BaseConnector):
+            meta = test_meta
+
+        connector = ConnectorRegistry.get("test_connector")
+        assert connector is not None
+        # meta.scopes is ["read", "write"]; this app overrides to read-only scopes.
+        resolved = ResolvedOAuth(
+            authorize_url=test_meta.oauth_authorize_url,
+            token_url=test_meta.oauth_token_url,
+            credentials=AppConnectorCredentials(
+                client_id="test_client_id",
+                client_secret="test_client_secret",
+                scopes=("read:user", "read:org"),
+            ),
+        )
+        url = await oauth_handler.build_authorize_url(
+            connector, "my_company:grok", resolved, "http://localhost/callback"
+        )
+        params = parse_qs(urlparse(url).query)
+        # The override is requested, NOT the connector default "read write".
+        assert params["scope"] == ["read:user read:org"]
+
+    def test_connection_records_overridden_scopes_when_token_omits_scope(
+        self, test_meta: ConnectorMeta
+    ) -> None:
+        """When the provider's token response omits `scope`, the connection records the
+        per-app requested scopes — so a scope-limited app never inherits meta.scopes."""
+        from broker.services.oauth import _build_connection_from_token
+
+        class TestConn(BaseConnector):
+            meta = test_meta
+
+        connector = ConnectorRegistry.get("test_connector")
+        assert connector is not None
+        conn = _build_connection_from_token(
+            connector,
+            {"access_token": "tok", "expires_in": 3600},  # no "scope" field
+            requested_scopes=("read:user", "read:org"),
+        )
+        assert conn.scopes == ["read:user", "read:org"]
+
     async def test_build_authorize_url_calls_hook(
         self, oauth_handler: OAuthHandler, test_credentials: AppConnectorCredentials
     ) -> None:

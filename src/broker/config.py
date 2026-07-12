@@ -206,7 +206,9 @@ class BrokerSettings(BaseModel):
 
     broker: BrokerConfig
     store: StoreConfig = StoreConfig()
-    apps: dict[str, dict[str, dict[str, dict[str, str]]]] = Field(
+    # Leaf values are usually strings (client_id/secret); optional `scopes` is a
+    # list[str] for per-app OAuth scope overrides (e.g. read-only GitHub for Grok).
+    apps: dict[str, dict[str, dict[str, dict[str, Any]]]] = Field(
         default_factory=dict,
         description="Per-app OAuth credentials: apps.{client_id}.{app_id}.{connector_name}.{field}",
     )
@@ -216,10 +218,10 @@ class BrokerSettings(BaseModel):
     )
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    def get_app_credentials(self, app_key: str, connector_name: str) -> dict[str, str]:
+    def get_app_credentials(self, app_key: str, connector_name: str) -> dict:
         """Look up OAuth credentials for an app + connector.
         app_key format: 'client_id:app_id' (e.g. 'my_company:app1').
-        Returns dict with client_id and client_secret.
+        Returns dict with client_id, client_secret, and optional scopes list.
         Raises KeyError if not found.
         """
         if ":" not in app_key:

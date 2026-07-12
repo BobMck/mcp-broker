@@ -175,10 +175,18 @@ class AppConnectorCredentials(BaseModel):
     """Per-app OAuth credentials from settings.yaml apps section.
 
     Looked up by app_key + connector_name at request time.
+
+    Optional ``scopes`` overrides ``ConnectorMeta.scopes`` for this app only
+    (e.g. a least-privilege Grok app requesting read-only GitHub scopes while
+    ``app1`` keeps full ``repo``). Empty/omitted → connector default scopes.
     """
 
     client_id: str = Field(..., min_length=1)
     client_secret: str = Field(..., min_length=1)
+    scopes: tuple[str, ...] = Field(
+        default=(),
+        description="Optional per-app OAuth scope override; empty = use connector meta scopes",
+    )
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

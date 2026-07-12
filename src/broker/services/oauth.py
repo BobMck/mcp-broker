@@ -189,7 +189,10 @@ class OAuthHandler:
         token_response = await self._post_token_request(
             connector, resolved.token_url, token_request_body, "exchange", auth_headers
         )
-        connection = _build_connection_from_token(connector, token_response)
+        requested = resolved.credentials.scopes or connector.meta.scopes
+        connection = _build_connection_from_token(
+            connector, token_response, requested_scopes=requested
+        )
 
         logger.info("[OAuth] Token exchange successful for %s/%s", app_key, connector.meta.name)
         return connection, app_key
@@ -318,8 +321,11 @@ class OAuthHandler:
             params["code_challenge"] = code_challenge
             params["code_challenge_method"] = "S256"
 
-        if connector.meta.scopes:
-            params["scope"] = " ".join(connector.meta.scopes)
+        # Per-app override (e.g. read-only GitHub for my_company:grok) wins over
+        # connector defaults so other apps can keep broader scopes.
+        scopes = resolved.credentials.scopes or connector.meta.scopes
+        if scopes:
+            params["scope"] = " ".join(scopes)
 
         return connector.customize_authorize_params(params)
 
@@ -415,17 +421,20 @@ def _apply_refreshed_token(
 def _build_connection_from_token(
     connector: BaseConnector,
     token_response: dict,
+    requested_scopes: tuple[str, ...] | list[str] | None = None,
 ) -> AppConnection:
     """Build AppConnection from parsed token response."""
+    if token_response.get("scope"):
+        scopes = token_response.get("scope", "").split()
+    elif requested_scopes:
+        scopes = list(requested_scopes)
+    else:
+        # meta.scopes is a tuple (frozen, immutable); AppConnection.scopes is list.
+        scopes = list(connector.meta.scopes)
     return AppConnection(
         connector_name=connector.meta.name,
         access_token=token_response["access_token"],
         refresh_token=token_response.get("refresh_token"),
         expires_at=_compute_expires_at(token_response),
-        scopes=(
-            token_response.get("scope", "").split()
-            if token_response.get("scope")
-            # meta.scopes is a tuple (frozen, immutable); AppConnection.scopes is list.
-            else list(connector.meta.scopes)
-        ),
+        scopes=scopes,
     )
