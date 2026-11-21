@@ -22,7 +22,7 @@ services:
     volumes:
       - ./tools.yaml:/config/tools.yaml:ro
     ports:
-      - "${BQ_TOOLBOX_HOST_PORT:-5000}:5000"
+      - "127.0.0.1:${BQ_TOOLBOX_HOST_PORT:-5000}:5000"
     networks:
       - sidecar-internal
     healthcheck:

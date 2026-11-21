@@ -106,7 +106,7 @@ Tokens are stored per-app in the broker's encrypted SQLite store. Token refresh 
 
 ## Local Dev
 
-When running the broker outside Docker, the sidecar publishes port 8010 to the host via `HOST_PORT` in `.env`. Start the broker with:
+When running the broker outside Docker, the sidecar publishes port 8010 on the host loopback (`127.0.0.1` only) via `HOST_PORT` in `.env`. Start the broker with:
 
 ```bash
 WORKSPACE_MCP_URL=http://localhost:8010/mcp PYTHONPATH=src uvicorn broker.main:app --port 8002
