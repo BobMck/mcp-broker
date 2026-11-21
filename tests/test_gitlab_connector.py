@@ -146,6 +146,12 @@ async def test_invalid_project_ref_rejected_before_any_http(connector) -> None:
     assert FakeAsyncClient.calls == []
 
 
+async def test_project_ref_with_trailing_newline_rejected(connector) -> None:
+    with pytest.raises(ValueError, match="Invalid project id or path"):
+        await connector.get_project(access_token="", project="bob/infra\n")
+    assert FakeAsyncClient.calls == []
+
+
 async def test_invalid_issue_state_rejected_before_any_http(connector) -> None:
     with pytest.raises(ValueError, match="Invalid issue state"):
         await connector.list_issues(access_token="", project="bob/infra", state="bogus")

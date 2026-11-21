@@ -165,6 +165,12 @@ async def test_invalid_instance_name_rejected_before_any_http(connector) -> None
     assert FakeAsyncClient.calls == []
 
 
+async def test_instance_name_with_trailing_newline_rejected(connector) -> None:
+    with pytest.raises(ValueError, match="Invalid instance name"):
+        await connector.reset_instance(access_token="", instance="my-vm\n")
+    assert FakeAsyncClient.calls == []
+
+
 async def test_upstream_error_maps_to_sanitized_valueerror(connector) -> None:
     FakeAsyncClient.responses = [
         _token_response(),

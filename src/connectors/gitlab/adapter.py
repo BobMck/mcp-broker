@@ -64,7 +64,7 @@ def _api_base() -> str:
 
 def _encode_project(project: str) -> str:
     """Validate then URL-encode a project id/path for use in a request path."""
-    if not isinstance(project, str) or not _PROJECT_REF_RE.match(project):
+    if not isinstance(project, str) or not _PROJECT_REF_RE.fullmatch(project):
         raise ValueError(f"Invalid project id or path: {project!r}")
     return quote(project, safe="")
 

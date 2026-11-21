@@ -151,6 +151,12 @@ async def test_invalid_device_id_rejected_before_any_http(connector) -> None:
     assert FakeAsyncClient.calls == []
 
 
+async def test_device_id_with_trailing_newline_rejected(connector) -> None:
+    with pytest.raises(ValueError, match="Invalid device id"):
+        await connector.get_device(access_token="", device_id="nABC123\n")
+    assert FakeAsyncClient.calls == []
+
+
 async def test_missing_credentials_is_a_readable_error(connector, monkeypatch) -> None:
     monkeypatch.delenv("TAILSCALE_OAUTH_CLIENT_SECRET")
     with pytest.raises(ValueError, match="Tailscale OAuth client credentials are not configured"):
