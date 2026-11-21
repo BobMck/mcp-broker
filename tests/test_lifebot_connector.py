@@ -1,4 +1,4 @@
-"""Lifebot native connector — static agent key, read-only tools, validation, error mapping."""
+"""Lifebot native connector — static read/write keys, tools, validation, error mapping."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from broker.connectors.registry import ConnectorRegistry
 # === FAKE HTTPX (same shape as tests/test_tailscale_connector.py) ===
 
 KEY = "test-agent-key-sentinel"
+WKEY = "test-write-key-sentinel"
 BASE = "https://lifebot.example.com"
 
 
@@ -60,6 +61,7 @@ def _reset(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(lb_adapter.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setenv("LIFEBOT_API_URL", BASE)
     monkeypatch.setenv("LIFEBOT_AGENT_KEY", KEY)
+    monkeypatch.setenv("LIFEBOT_AGENT_WRITE_KEY", WKEY)
 
 
 @pytest.fixture
@@ -87,12 +89,22 @@ async def test_exactly_the_specified_tools_are_registered(connector) -> None:
     assert sorted(t["name"] for t in tools) == [
         "get_brief",
         "get_goals",
+        "get_messages",
         "get_metrics",
+        "get_study",
+        "get_study_plan",
         "get_workouts",
+        "post_reply",
+        "save_study_plan",
     ]
     assert all(t["inputSchema"]["type"] == "object" for t in tools)
     metrics = next(t for t in tools if t["name"] == "get_metrics")
     assert metrics["inputSchema"]["required"] == ["names"]
+    save = next(t for t in tools if t["name"] == "save_study_plan")
+    assert save["inputSchema"]["required"] == ["plan"]
+    assert save["inputSchema"]["properties"]["plan"]["required"] == ["goal", "focus"]
+    reply = next(t for t in tools if t["name"] == "post_reply")
+    assert reply["inputSchema"]["required"] == ["text"]
 
 
 def test_meta_is_a_static_credential_native_connector(connector) -> None:
@@ -469,3 +481,492 @@ async def test_jsonrpc_error_for_rejected_argument_does_not_leak_key(connector) 
     )
     assert KEY not in json.dumps(result)
     assert FakeAsyncClient.calls == []
+
+
+# === STUDY / MESSAGES: SHARED HELPERS ===
+
+READ_HEADER = "x-lifebot-agent-key"
+WRITE_HEADER = "x-lifebot-agent-write-key"
+PLAN = {
+    "goal": "Finish the networking course",
+    "focus": [{"course_id": "course-a", "order": 1}],
+}
+
+
+def _assert_only_key(kwargs: dict, header: str, key: str) -> None:
+    """Exactly one credential header was sent, and the other key value is nowhere in it."""
+    assert kwargs["headers"] == {header: key}
+    other = WKEY if key == KEY else KEY
+    assert other not in json.dumps(kwargs, default=str)
+
+
+def _plan_of_size(size: int) -> dict[str, Any]:
+    plan: dict[str, Any] = {**PLAN, "notes": ""}
+    base = len(json.dumps(plan, separators=(",", ":")).encode())
+    plan["notes"] = "x" * (size - base)
+    assert len(json.dumps(plan, separators=(",", ":")).encode()) == size
+    return plan
+
+
+# === STUDY / MESSAGES: READ HAPPY PATHS ===
+
+
+async def test_get_study_defaults_send_no_params_and_the_read_key(connector) -> None:
+    payload = {"courses": [], "summary": {"count": 0}, "notes": ["No snapshot history yet"]}
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.get_study(access_token="")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("GET", f"{BASE}/agent/study")
+    assert kwargs["params"] == {}
+    _assert_only_key(kwargs, READ_HEADER, KEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_get_study_passes_days(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"courses": []})]
+    await connector.get_study(access_token="", days=90)
+    assert _last_call()[2]["params"] == {"days": "90"}
+
+
+async def test_get_study_plan_sends_the_read_key(connector) -> None:
+    payload = {"proposed": {"version": "STUDY#x", "status": "proposed", "plan": PLAN}}
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.get_study_plan(access_token="")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("GET", f"{BASE}/agent/study-plan")
+    assert kwargs["params"] == {}
+    _assert_only_key(kwargs, READ_HEADER, KEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_get_messages_defaults_send_no_params(connector) -> None:
+    payload = {"conversation": "main", "messages": []}
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.get_messages(access_token="")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("GET", f"{BASE}/agent/messages")
+    assert kwargs["params"] == {}
+    _assert_only_key(kwargs, READ_HEADER, KEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_get_messages_passes_conversation_and_limit(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"messages": []})]
+    await connector.get_messages(access_token="", conversation="web_page-2", limit=5)
+    assert _last_call()[2]["params"] == {"conversation": "web_page-2", "limit": "5"}
+
+
+@pytest.mark.parametrize("conversation", ["a", "a" * 32, "a-b_c9"])
+async def test_conversation_bounds_are_inclusive(connector, conversation) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"messages": []})]
+    await connector.get_messages(access_token="", conversation=conversation)
+    assert _last_call()[2]["params"] == {"conversation": conversation}
+
+
+@pytest.mark.parametrize("limit", [1, 50])
+async def test_limit_bounds_are_inclusive(connector, limit) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"messages": []})]
+    await connector.get_messages(access_token="", limit=limit)
+    assert _last_call()[2]["params"] == {"limit": str(limit)}
+
+
+# === STUDY / MESSAGES: WRITE HAPPY PATHS ===
+
+
+async def test_save_study_plan_puts_the_plan_with_the_write_key_only(connector) -> None:
+    payload = {
+        "saved": True,
+        "version": "STUDY#2026-01-01T00:00:00.000Z",
+        "status": "proposed",
+        "unknown_course_ids": ["course-a"],
+    }
+    FakeAsyncClient.responses = [FakeResponse(201, payload)]
+    content = await connector.save_study_plan(access_token="", plan=PLAN)
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("PUT", f"{BASE}/agent/study-plan")
+    assert kwargs["json"] == PLAN
+    assert "params" not in kwargs
+    _assert_only_key(kwargs, WRITE_HEADER, WKEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_save_study_plan_passes_a_full_plan_through_unchanged(connector) -> None:
+    plan = {
+        "goal": "Pass the exam",
+        "why": "Career",
+        "deadline": "2026-12-31",
+        "weekly_hours": 6.5,
+        "focus": [
+            {"course_id": "course-a", "order": 1, "title": "A", "target_completion": 80},
+            {"course_id": "course-b", "order": 2, "target_date": "2026-11-30"},
+        ],
+        "milestones": [{"date": "2026-12-01", "text": "Mock exam"}],
+        "notes": "café ☕",
+    }
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True})]
+    await connector.save_study_plan(access_token="", plan=plan)
+    assert _last_call()[2]["json"] == plan
+
+
+async def test_plan_of_exactly_20480_bytes_is_accepted(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True})]
+    await connector.save_study_plan(access_token="", plan=_plan_of_size(20480))
+    assert len(FakeAsyncClient.calls) == 1
+
+
+async def test_post_reply_posts_text_with_the_write_key_only(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True, "id": "m-1"})]
+    content = await connector.post_reply(access_token="", text="Hello there")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("POST", f"{BASE}/agent/messages/reply")
+    assert kwargs["json"] == {"text": "Hello there"}  # conversation omitted -> server default
+    assert "params" not in kwargs
+    _assert_only_key(kwargs, WRITE_HEADER, WKEY)
+    assert json.loads(content[0]["text"]) == {"saved": True, "id": "m-1"}
+
+
+async def test_post_reply_passes_conversation(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True, "id": "m-2"})]
+    await connector.post_reply(access_token="", text="Hi", conversation="side_chat")
+    assert _last_call()[2]["json"] == {"text": "Hi", "conversation": "side_chat"}
+
+
+@pytest.mark.parametrize("length", [1, 8000])
+async def test_reply_text_bounds_are_inclusive(connector, length) -> None:
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True, "id": "m"})]
+    await connector.post_reply(access_token="", text="x" * length)
+    assert _last_call()[2]["json"] == {"text": "x" * length}
+
+
+# === STUDY / MESSAGES: VALIDATION (rejected before any HTTP) ===
+
+
+@pytest.mark.parametrize(
+    "conversation",
+    [
+        "main\n",  # trailing newline
+        "\nmain",
+        "Main",  # uppercase
+        "a" * 33,  # too long
+        "",
+        "a b",
+        "a/b",
+        "a.b",
+        "main&limit=1",  # query injection
+        "ｍain",  # non-ASCII look-alike
+        5,
+        ["main"],
+    ],
+)
+async def test_bad_conversation_rejected_for_read_and_write(connector, conversation) -> None:
+    with pytest.raises(ValueError, match="Invalid conversation"):
+        await connector.get_messages(access_token="", conversation=conversation)
+    with pytest.raises(ValueError, match="Invalid conversation"):
+        await connector.post_reply(access_token="", text="hi", conversation=conversation)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("limit", [0, 51, -1, True, False, 5.0, "5", [5]])
+async def test_bad_limit_rejected(connector, limit) -> None:
+    with pytest.raises(ValueError, match="Invalid limit"):
+        await connector.get_messages(access_token="", limit=limit)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("days", [0, 366, -1, True, False, 7.0, "7", [7]])
+async def test_bad_days_rejected_for_study(connector, days) -> None:
+    with pytest.raises(ValueError, match="Invalid days"):
+        await connector.get_study(access_token="", days=days)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("days", [1, 365])
+async def test_study_days_bounds_are_inclusive(connector, days) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"courses": []})]
+    await connector.get_study(access_token="", days=days)
+    assert _last_call()[2]["params"] == {"days": str(days)}
+
+
+@pytest.mark.parametrize("plan", [[PLAN], "a plan", 5, None, True, (PLAN,)])
+async def test_plan_must_be_an_object(connector, plan) -> None:
+    with pytest.raises(ValueError, match="expected a JSON object"):
+        await connector.save_study_plan(access_token="", plan=plan)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_plan_over_20480_bytes_rejected(connector) -> None:
+    with pytest.raises(ValueError, match="too large"):
+        await connector.save_study_plan(access_token="", plan=_plan_of_size(20481))
+    assert FakeAsyncClient.calls == []
+
+
+async def test_plan_size_counts_utf8_bytes_not_characters(connector) -> None:
+    # 10,500 two-byte characters: well under 20480 characters, over 20480 bytes.
+    plan = {**PLAN, "notes": "é" * 10500}
+    with pytest.raises(ValueError, match="too large"):
+        await connector.save_study_plan(access_token="", plan=plan)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("plan", [{"goal": float("nan"), "focus": [1]}, {**PLAN, "x": {1, 2}}])
+async def test_plan_must_be_plain_json_data(connector, plan) -> None:
+    with pytest.raises(ValueError, match="plain JSON"):
+        await connector.save_study_plan(access_token="", plan=plan)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("goal", [None, "", 5, ["x"], True])
+async def test_plan_needs_a_non_empty_string_goal(connector, goal) -> None:
+    with pytest.raises(ValueError, match="goal must be a non-empty string"):
+        await connector.save_study_plan(access_token="", plan={**PLAN, "goal": goal})
+    with pytest.raises(ValueError, match="goal must be a non-empty string"):
+        await connector.save_study_plan(access_token="", plan={"focus": PLAN["focus"]})
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("focus", [None, [], "course-a", {"course_id": "a"}, 1])
+async def test_plan_needs_a_non_empty_focus_list(connector, focus) -> None:
+    with pytest.raises(ValueError, match="focus must be a non-empty list"):
+        await connector.save_study_plan(access_token="", plan={**PLAN, "focus": focus})
+    with pytest.raises(ValueError, match="focus must be a non-empty list"):
+        await connector.save_study_plan(access_token="", plan={"goal": "g"})
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("text", ["", "x" * 8001, None, 5, ["hi"]])
+async def test_bad_reply_text_rejected(connector, text) -> None:
+    with pytest.raises(ValueError, match="Invalid text"):
+        await connector.post_reply(access_token="", text=text)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_validation_errors_do_not_echo_plan_or_text(connector) -> None:
+    secret_plan = {"goal": "", "focus": [{"course_id": "private-course-id", "order": 1}]}
+    with pytest.raises(ValueError) as plan_error:
+        await connector.save_study_plan(access_token="", plan=secret_plan)
+    with pytest.raises(ValueError) as text_error:
+        await connector.post_reply(access_token="", text="private message " * 600)
+    assert "private" not in str(plan_error.value)
+    assert "private" not in str(text_error.value)
+
+
+# === STUDY / MESSAGES: CONFIGURATION (two keys) ===
+
+
+async def test_missing_write_key_blocks_both_write_tools_before_any_http(
+    connector, monkeypatch
+) -> None:
+    monkeypatch.delenv("LIFEBOT_AGENT_WRITE_KEY")
+    with pytest.raises(ValueError, match="Lifebot write key is not configured on the broker"):
+        await connector.save_study_plan(access_token="", plan=PLAN)
+    with pytest.raises(ValueError, match="Lifebot write key is not configured on the broker"):
+        await connector.post_reply(access_token="", text="hi")
+    assert FakeAsyncClient.calls == []
+
+
+async def test_empty_write_key_counts_as_not_configured(connector, monkeypatch) -> None:
+    monkeypatch.setenv("LIFEBOT_AGENT_WRITE_KEY", "")
+    with pytest.raises(ValueError, match="write key is not configured"):
+        await connector.post_reply(access_token="", text="hi")
+    assert FakeAsyncClient.calls == []
+
+
+async def test_read_tools_keep_working_without_the_write_key(connector, monkeypatch) -> None:
+    monkeypatch.delenv("LIFEBOT_AGENT_WRITE_KEY")
+    FakeAsyncClient.responses = [FakeResponse(200, {}) for _ in range(5)]
+    await connector.get_brief(access_token="")
+    await connector.get_study(access_token="")
+    await connector.get_study_plan(access_token="")
+    await connector.get_messages(access_token="")
+    await connector.get_goals(access_token="")
+    assert len(FakeAsyncClient.calls) == 5
+    for _, _, kwargs in FakeAsyncClient.calls:
+        _assert_only_key(kwargs, READ_HEADER, KEY)
+
+
+async def test_write_tools_work_without_the_read_key_and_never_send_it(
+    connector, monkeypatch
+) -> None:
+    monkeypatch.delenv("LIFEBOT_AGENT_KEY")
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True}) for _ in range(2)]
+    await connector.save_study_plan(access_token="", plan=PLAN)
+    await connector.post_reply(access_token="", text="hi")
+    for _, _, kwargs in FakeAsyncClient.calls:
+        assert kwargs["headers"] == {WRITE_HEADER: WKEY}
+
+
+async def test_write_tools_need_the_api_url(connector, monkeypatch) -> None:
+    monkeypatch.delenv("LIFEBOT_API_URL")
+    with pytest.raises(ValueError, match="Lifebot API URL is not configured on the broker"):
+        await connector.post_reply(access_token="", text="hi")
+    assert FakeAsyncClient.calls == []
+
+
+# === STUDY / MESSAGES: UPSTREAM ERROR MAPPING ===
+
+READ_CALLS = [
+    lambda c: c.get_study(access_token=""),
+    lambda c: c.get_study_plan(access_token=""),
+    lambda c: c.get_messages(access_token=""),
+]
+WRITE_CALLS = [
+    lambda c: c.save_study_plan(access_token="", plan=PLAN),
+    lambda c: c.post_reply(access_token="", text="hi"),
+]
+
+
+@pytest.mark.parametrize("call", READ_CALLS)
+async def test_read_route_401_and_503_name_the_read_key(connector, call) -> None:
+    FakeAsyncClient.responses = [FakeResponse(401, {"error": "unauthorized"})]
+    with pytest.raises(ValueError, match=r"agent key \(401\).*LIFEBOT_AGENT_KEY"):
+        await call(connector)
+    FakeAsyncClient.responses = [FakeResponse(503, {"error": "agent key not configured"})]
+    with pytest.raises(ValueError, match=r"Lifebot's agent key is not configured on the Lifebot"):
+        await call(connector)
+
+
+@pytest.mark.parametrize("call", WRITE_CALLS)
+async def test_write_route_401_names_the_write_key(connector, call) -> None:
+    FakeAsyncClient.responses = [FakeResponse(401, {"error": "unauthorized"})]
+    with pytest.raises(ValueError, match=r"WRITE key \(401\).*LIFEBOT_AGENT_WRITE_KEY"):
+        await call(connector)
+
+
+@pytest.mark.parametrize("call", WRITE_CALLS)
+async def test_write_route_503_means_write_key_not_configured_upstream(connector, call) -> None:
+    FakeAsyncClient.responses = [FakeResponse(503, {"error": "agent write key not configured"})]
+    with pytest.raises(ValueError, match=r"write key is not configured on the Lifebot side"):
+        await call(connector)
+
+
+@pytest.mark.parametrize("call", WRITE_CALLS)
+async def test_write_route_409_means_try_again(connector, call) -> None:
+    FakeAsyncClient.responses = [FakeResponse(409, {"error": "conflict", "detail": "retry"})]
+    with pytest.raises(ValueError) as excinfo:
+        await call(connector)
+    assert str(excinfo.value) == "Lifebot was updated at the same time; try again"
+
+
+async def test_write_route_400_surfaces_the_api_detail(connector) -> None:
+    detail = "focus[1].course_id duplicates an earlier focus item"
+    FakeAsyncClient.responses = [FakeResponse(400, {"error": "invalid plan", "detail": detail})]
+    with pytest.raises(ValueError, match=r"\(400\): focus\[1\]\.course_id duplicates"):
+        await connector.save_study_plan(access_token="", plan=PLAN)
+    FakeAsyncClient.responses = [
+        FakeResponse(400, {"error": "invalid message", "detail": "text must be 1-8000 characters"})
+    ]
+    with pytest.raises(ValueError, match="text must be 1-8000 characters"):
+        await connector.post_reply(access_token="", text="hi")
+
+
+@pytest.mark.parametrize("call", READ_CALLS)
+async def test_read_route_400_surfaces_the_api_detail(connector, call) -> None:
+    FakeAsyncClient.responses = [
+        FakeResponse(400, {"error": "invalid parameter", "detail": "limit must be 1-50"})
+    ]
+    with pytest.raises(ValueError, match=r"\(400\): limit must be 1-50"):
+        await call(connector)
+
+
+@pytest.mark.parametrize("call", [*READ_CALLS, *WRITE_CALLS])
+async def test_429_and_other_statuses_map_on_new_routes(connector, call) -> None:
+    FakeAsyncClient.responses = [FakeResponse(429, {"message": "Too Many Requests"})]
+    with pytest.raises(ValueError, match="rate limited.*retry later"):
+        await call(connector)
+    FakeAsyncClient.responses = [FakeResponse(500, {"error": "internal error", "trace": "x"})]
+    with pytest.raises(ValueError) as excinfo:
+        await call(connector)
+    assert str(excinfo.value) == "Lifebot API error 500"
+
+
+@pytest.mark.parametrize("call", WRITE_CALLS)
+async def test_write_transport_error_and_bad_body_are_readable(connector, call) -> None:
+    FakeAsyncClient.responses = [httpx.ConnectError(f"connection failed to {BASE}/agent/x")]
+    with pytest.raises(ValueError) as excinfo:
+        await call(connector)
+    assert "unreachable" in str(excinfo.value)
+    assert BASE not in str(excinfo.value)
+    FakeAsyncClient.responses = [FakeResponse(201, text="<html>oops</html>")]
+    with pytest.raises(ValueError, match="invalid response"):
+        await call(connector)
+
+
+# === STUDY / MESSAGES: NEITHER KEY EVER LEAKS ===
+
+
+async def test_neither_key_appears_in_errors_or_results(connector) -> None:
+    echo = {"error": f"bad {KEY} {WKEY}", "detail": "ok", "message": f"{KEY}{WKEY}"}
+    statuses = [400, 401, 409, 429, 500, 503]
+    for call in [*READ_CALLS, *WRITE_CALLS]:
+        scenarios: list[Any] = [FakeResponse(s, echo) for s in statuses]
+        scenarios.append(httpx.ConnectError(f"failed with {KEY} and {WKEY}"))
+        for scenario in scenarios:
+            FakeAsyncClient.responses = [scenario]
+            try:
+                content = await call(connector)
+            except ValueError as exc:
+                assert KEY not in str(exc)
+                assert WKEY not in str(exc)
+            else:
+                assert KEY not in json.dumps(content)
+                assert WKEY not in json.dumps(content)
+
+
+async def test_each_key_goes_only_to_its_own_routes(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {}) for _ in READ_CALLS]
+    FakeAsyncClient.responses += [FakeResponse(201, {}) for _ in WRITE_CALLS]
+    for call in [*READ_CALLS, *WRITE_CALLS]:
+        await call(connector)
+    reads, writes = FakeAsyncClient.calls[:3], FakeAsyncClient.calls[3:]
+    for method, _, kwargs in reads:
+        assert method == "GET"
+        _assert_only_key(kwargs, READ_HEADER, KEY)
+    for method, _, kwargs in writes:
+        assert method in {"PUT", "POST"}
+        _assert_only_key(kwargs, WRITE_HEADER, WKEY)
+
+
+async def test_keys_and_content_never_in_logs_via_the_mcp_dispatcher(connector, caplog) -> None:
+    # Goes through handle_mcp_request, which is where tool failures are logged.
+    private_text = "private-message-text-sentinel"
+    private_goal = "private-goal-sentinel"
+    calls: list[tuple[str, dict[str, Any], Any]] = [
+        ("post_reply", {"text": private_text}, FakeResponse(401, {})),
+        ("post_reply", {"text": private_text}, FakeResponse(409, {})),
+        ("post_reply", {"text": ""}, FakeResponse(201, {})),  # validation failure
+        ("save_study_plan", {"plan": {**PLAN, "goal": private_goal}}, FakeResponse(503, {})),
+        ("save_study_plan", {"plan": {"goal": private_goal}}, FakeResponse(201, {})),
+        ("save_study_plan", {"plan": PLAN}, FakeResponse(201, {"saved": True})),
+        ("get_messages", {"conversation": "main"}, FakeResponse(401, {})),
+        ("get_study", {"days": 30}, httpx.ConnectError(f"failed with {KEY}")),
+    ]
+    results = []
+    with caplog.at_level("DEBUG"):
+        for name, arguments, response in calls:
+            FakeAsyncClient.responses = [response]
+            results.append(
+                await connector.handle_mcp_request(
+                    method="tools/call",
+                    params={"name": name, "arguments": arguments},
+                    request_id=1,
+                    access_token="",
+                )
+            )
+    assert "Tool post_reply failed" in caplog.text  # failures are logged, so the checks below bite
+    for leak in (KEY, WKEY, private_text, private_goal):
+        assert leak not in caplog.text
+        assert leak not in json.dumps(results)
+
+
+async def test_jsonrpc_dispatch_reaches_the_write_tools(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(201, {"saved": True, "id": "m-9"})]
+    result = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "post_reply", "arguments": {"text": "hi", "conversation": "main"}},
+        request_id=3,
+        access_token="",
+    )
+    assert "error" not in result
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("POST", f"{BASE}/agent/messages/reply")
+    assert kwargs["json"] == {"text": "hi", "conversation": "main"}
