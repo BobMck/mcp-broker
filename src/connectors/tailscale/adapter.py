@@ -58,7 +58,7 @@ def _tailnet() -> str:
 
 
 def _validate_device_id(device_id: str) -> str:
-    if not isinstance(device_id, str) or not _DEVICE_ID_RE.match(device_id):
+    if not isinstance(device_id, str) or not _DEVICE_ID_RE.fullmatch(device_id):
         raise ValueError(f"Invalid device id: {device_id!r}")
     return device_id
 

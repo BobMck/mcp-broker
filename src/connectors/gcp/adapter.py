@@ -65,7 +65,7 @@ def _zone() -> str:
 
 
 def _validate_instance(name: str) -> str:
-    if not isinstance(name, str) or not _INSTANCE_NAME_RE.match(name):
+    if not isinstance(name, str) or not _INSTANCE_NAME_RE.fullmatch(name):
         raise ValueError(f"Invalid instance name: {name!r}")
     return name
 

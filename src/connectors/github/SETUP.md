@@ -18,7 +18,7 @@ Because discovery is unavailable, the broker uses a GitHub OAuth app whose
 
 1. Sign in to GitHub and go to **Settings → Developer settings → OAuth Apps → New OAuth App**.
 2. Create a new OAuth application.
-3. Set the **Authorization callback URL** to `https://bobsmcp.uk/oauth/github/callback`.
+3. Set the **Authorization callback URL** to `https://mcp.example.com/oauth/github/callback`.
 4. Record the **Client ID** and generate a **Client Secret**.
 
 ## Required Scopes

@@ -19,7 +19,7 @@ which are the trusted admin plane. Those requests carry no ``Cf-*`` headers and
 pass through untouched.
 
 This is defense-in-depth behind the recommended edge rule (a Cloudflare WAF /
-Access block on ``bobsmcp.uk/admin/*``): even if that edge rule is ever removed
+Access block on ``mcp.example.com/admin/*``): even if that edge rule is ever removed
 or misconfigured, the origin still refuses tunnelled admin traffic.
 """
 

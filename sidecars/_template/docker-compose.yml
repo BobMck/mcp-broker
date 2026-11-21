@@ -19,7 +19,7 @@ services:
       --outputTransport streamableHttp
     env_file: .env
     ports:
-      - "${HOST_PORT:-}:${MCP_PORT:-8000}"    # Set HOST_PORT for local dev (broker on host)
+      - "127.0.0.1:${HOST_PORT:-}:${MCP_PORT:-8000}"    # Set HOST_PORT for local dev (broker on host); loopback only
     volumes:
       - ./config:/root/.config
     networks:
