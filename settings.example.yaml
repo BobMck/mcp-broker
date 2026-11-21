@@ -12,6 +12,7 @@ broker:
     - tailscale  # Native, auth_mode=none — scoped OAuth client (see src/connectors/tailscale/SETUP.md)
     - gitlab     # Native, auth_mode=none — read_api PAT via GITLAB_TOKEN (see src/connectors/gitlab/SETUP.md)
     - adzuna     # Native, auth_mode=none — app_id/app_key jobs API (see src/connectors/adzuna/SETUP.md)
+    - lifebot    # Native, auth_mode=none — read-only health summaries via LIFEBOT_API_URL + LIFEBOT_AGENT_KEY (see src/connectors/lifebot/SETUP.md)
   admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
   encryption_keys:
     - ${BROKER_ENCRYPTION_KEY}
