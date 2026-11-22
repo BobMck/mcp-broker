@@ -5,15 +5,16 @@ Native connector wrapping the Lifebot agent API (compact, pre-computed summaries
 of the owner's personal health data). auth_mode="none": the credentials are static
 keys supplied through the broker environment. The read key (`LIFEBOT_AGENT_KEY`)
 is sent only in the `x-lifebot-agent-key` header, on GET routes; the write key
-(`LIFEBOT_AGENT_WRITE_KEY`) only in `x-lifebot-agent-write-key`, on the two write
+(`LIFEBOT_AGENT_WRITE_KEY`) only in `x-lifebot-agent-write-key`, on the write
 routes. Neither is ever logged or returned in a tool result or error message.
 
 Least-privilege by design (mirrors the gcp/tailscale/gitlab connectors):
 - read tools: daily brief, metric time series, workouts, goals, study progress,
-  study plan, messages.
-- two write tools, using the separate write key: save a study plan as a PROPOSAL
-  (the owner accepts or discards it on his page) and post an assistant reply.
-  Nothing else can be written through this connector.
+  study plan, dated daily study tasks, messages.
+- three write tools, using the separate write key: save a study plan as a PROPOSAL
+  (the owner accepts or discards it on his page), replace the daily study tasks for
+  a date range, and post an assistant reply. Nothing else can be written through
+  this connector.
 - API pinned from env (`LIFEBOT_API_URL`, https:// only).
 """
 
@@ -52,6 +53,8 @@ _LIMIT_MIN = 1
 _LIMIT_MAX = 50
 _PLAN_MAX_BYTES = 20480
 _TEXT_MAX_CHARS = 8000
+_TASKS_MAX = 60
+_TASKS_MAX_BYTES = 102400
 
 # ASCII-only: a bare \d also matches non-ASCII Unicode digits. The patterns also
 # keep anything but plain tokens out of the query string.
@@ -174,6 +177,33 @@ def _validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(focus, list) or not focus:
         raise ValueError("Invalid plan: focus must be a non-empty list")
     return plan
+
+
+def _validate_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shape and size only — the API validates every field. Never echoes task content."""
+    if not isinstance(tasks, list):
+        raise ValueError("Invalid tasks: expected a list")
+    if len(tasks) > _TASKS_MAX:
+        raise ValueError(f"Invalid tasks: at most {_TASKS_MAX} tasks per call")
+    if not all(isinstance(task, dict) for task in tasks):
+        raise ValueError("Invalid tasks: every task must be a JSON object")
+    try:
+        size = len(
+            json.dumps(tasks, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        )
+    except (TypeError, ValueError):
+        raise ValueError("Invalid tasks: must be plain JSON data") from None
+    if size > _TASKS_MAX_BYTES:
+        raise ValueError(f"Invalid tasks: too large ({size} bytes; limit {_TASKS_MAX_BYTES})")
+    return tasks
+
+
+def _take_arguments(arguments: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
+    """`from` is a Python keyword, so these tools receive their arguments as a dict."""
+    unknown = sorted(set(arguments) - set(allowed))
+    if unknown:
+        raise ValueError(f"Unknown argument(s): {', '.join(unknown)}")
+    return arguments
 
 
 def _validate_text(text: str) -> str:
@@ -553,6 +583,142 @@ _SAVE_STUDY_PLAN_META = NativeToolMeta(
     },
 )
 
+_DATE_PATTERN = "^\\d{4}-\\d{2}-\\d{2}$"
+
+_GET_STUDY_TASKS_META = NativeToolMeta(
+    name="get_study_tasks",
+    description=(
+        "Get the owner's dated daily study tasks, with what is done. One entry per "
+        "calendar date in the range, oldest first: each day lists its tasks in order "
+        "(id, title, minutes, kind, optional url, link_label, course_id and note, done "
+        "and done_at) with planned and done minutes, plus totals for the range. "
+        "Defaults to today plus six days; at most 35 days. Use it to see what the owner "
+        "has ticked off and what is already planned before saving new tasks. " + _PRIVACY_NOTE
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "from": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": "First date, a real date YYYY-MM-DD (default: today).",
+            },
+            "to": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": (
+                    "Last date, a real date YYYY-MM-DD, not before from, at most 35 days "
+                    "inclusive (default: from plus six days)."
+                ),
+            },
+        },
+    },
+)
+
+_TASK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "date": {
+            "type": "string",
+            "pattern": _DATE_PATTERN,
+            "description": "The day to do it, a real date YYYY-MM-DD inside from..to.",
+        },
+        "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 140,
+            "description": "What to do, 1-140 chars.",
+        },
+        "minutes": {
+            "type": "integer",
+            "minimum": 5,
+            "maximum": 240,
+            "description": "Planned length in minutes, 5-240.",
+        },
+        "kind": {
+            "type": "string",
+            "enum": ["video", "reading", "lab", "practice", "review", "exam", "other"],
+            "description": "Type of task (default 'other').",
+        },
+        "url": {
+            "type": "string",
+            "maxLength": 500,
+            "pattern": "^https://",
+            "description": "Where to do it. https only, up to 500 chars.",
+        },
+        "link_label": {
+            "type": "string",
+            "maxLength": 60,
+            "description": "Short name for the link, up to 60 chars.",
+        },
+        "course_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": (
+                "A course id exactly as returned by get_study, when the task belongs to "
+                "one. Unknown ids are still saved and listed in unknown_course_ids."
+            ),
+        },
+        "note": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Extra instruction, up to 300 chars.",
+        },
+    },
+    "required": ["date", "title", "minutes"],
+}
+
+_SAVE_STUDY_TASKS_META = NativeToolMeta(
+    name="save_study_tasks",
+    description=(
+        "Plan the owner's daily study tasks for a date range. This REPLACES the plan "
+        "for the whole range from..to: every task in the range that is not done is "
+        "removed, tasks the owner has already done are kept untouched, and then the "
+        "tasks you send are added (ordered within each date as given, after any kept "
+        "done tasks). Days in the range with no tasks in your list end up with no "
+        "not-done tasks, and an empty tasks list clears the range. So plan only the "
+        "range you intend to replace, and call get_study_tasks first to see what is "
+        "there and what is done. Limits: from must be today (the owner's local date) "
+        "or later, from not after to, at most 14 days inclusive; every task date "
+        "inside from..to; at most 60 tasks in the call and 8 per date; url must be "
+        "https. Returns saved, kept_done, removed and unknown_course_ids. On a 400 the "
+        "message says which field is wrong; fix it and call again."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "from": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": (
+                    "First date of the range being replaced, a real date YYYY-MM-DD, "
+                    "today or later."
+                ),
+            },
+            "to": {
+                "type": "string",
+                "pattern": _DATE_PATTERN,
+                "description": (
+                    "Last date of the range being replaced, a real date YYYY-MM-DD, "
+                    "not before from, at most 14 days inclusive."
+                ),
+            },
+            "tasks": {
+                "type": "array",
+                "maxItems": _TASKS_MAX,
+                "description": (
+                    f"The complete not-done plan for from..to, up to {_TASKS_MAX} tasks, "
+                    "up to 8 per date. May be empty to clear the range."
+                ),
+                "items": _TASK_SCHEMA,
+            },
+        },
+        "required": ["from", "to", "tasks"],
+    },
+)
+
 _POST_REPLY_META = NativeToolMeta(
     name="post_reply",
     description=(
@@ -589,7 +755,7 @@ _POST_REPLY_META = NativeToolMeta(
 
 
 class LifebotConnector(NativeConnector):
-    """Lifebot native connector — read tools plus two write tools (plan proposal, reply)."""
+    """Lifebot native connector — read tools plus write tools (plan proposal, tasks, reply)."""
 
     meta = ConnectorMeta(
         name="lifebot",
@@ -654,6 +820,14 @@ class LifebotConnector(NativeConnector):
             params["limit"] = str(_validate_limit(limit))
         return _mcp_text_content(await _lifebot_get("/agent/messages", params))
 
+    @native_tool(_GET_STUDY_TASKS_META)
+    async def get_study_tasks(
+        self, *, access_token: str = "", **arguments: Any
+    ) -> list[dict[str, Any]]:
+        args = _take_arguments(arguments, ("from", "to"))
+        params = {key: _validate_date(args[key]) for key in ("from", "to") if key in args}
+        return _mcp_text_content(await _lifebot_get("/agent/study-tasks", params))
+
     @native_tool(_SAVE_STUDY_PLAN_META)
     async def save_study_plan(
         self, *, access_token: str = "", plan: dict[str, Any]
@@ -661,6 +835,21 @@ class LifebotConnector(NativeConnector):
         return _mcp_text_content(
             await _lifebot_write("PUT", "/agent/study-plan", _validate_plan(plan))
         )
+
+    @native_tool(_SAVE_STUDY_TASKS_META)
+    async def save_study_tasks(
+        self, *, access_token: str = "", **arguments: Any
+    ) -> list[dict[str, Any]]:
+        args = _take_arguments(arguments, ("from", "to", "tasks"))
+        missing = [key for key in ("from", "to", "tasks") if key not in args]
+        if missing:
+            raise ValueError(f"Missing argument(s): {', '.join(missing)}")
+        body = {
+            "from": _validate_date(args["from"]),
+            "to": _validate_date(args["to"]),
+            "tasks": _validate_tasks(args["tasks"]),
+        }
+        return _mcp_text_content(await _lifebot_write("PUT", "/agent/study-tasks", body))
 
     @native_tool(_POST_REPLY_META)
     async def post_reply(
