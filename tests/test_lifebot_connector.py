@@ -88,6 +88,7 @@ async def test_exactly_the_specified_tools_are_registered(connector) -> None:
     tools = result["result"]["tools"]
     assert sorted(t["name"] for t in tools) == [
         "get_brief",
+        "get_course_curriculum",
         "get_goals",
         "get_messages",
         "get_metrics",
@@ -844,6 +845,7 @@ READ_CALLS = [
     lambda c: c.get_study_plan(access_token=""),
     lambda c: c.get_messages(access_token=""),
     lambda c: c.get_study_tasks(access_token=""),
+    lambda c: c.get_course_curriculum(access_token="", course_id="5072786"),
 ]
 WRITE_CALLS = [
     lambda c: c.save_study_plan(access_token="", plan=PLAN),
@@ -1231,3 +1233,122 @@ async def test_jsonrpc_dispatch_reaches_the_study_tasks_tools(connector) -> None
     )
     assert bad["result"]["isError"] is True
     assert "Missing argument" in bad["result"]["content"][0]["text"]
+
+
+# === COURSE CURRICULUM ===
+
+
+async def test_get_course_curriculum_schema(connector) -> None:
+    result = await connector.handle_mcp_request(
+        method="tools/list", params={}, request_id=1, access_token=""
+    )
+    tool = next(t for t in result["result"]["tools"] if t["name"] == "get_course_curriculum")
+    assert tool["inputSchema"]["required"] == ["course_id"]
+    assert sorted(tool["inputSchema"]["properties"]) == ["brief", "course_id"]
+    assert tool["inputSchema"]["properties"]["brief"]["type"] == "boolean"
+    assert "404" in tool["description"]
+
+
+async def test_get_course_curriculum_sends_course_id_and_the_read_key(connector) -> None:
+    payload = {
+        "course_id": "5072786",
+        "totals": {"items": 2, "done": 1},
+        "next": [],
+        "sections": [],
+    }
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.get_course_curriculum(access_token="", course_id="5072786")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("GET", f"{BASE}/agent/study-curriculum")
+    assert kwargs["params"] == {"course_id": "5072786"}
+    assert "json" not in kwargs
+    _assert_only_key(kwargs, READ_HEADER, KEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_get_course_curriculum_sends_brief_only_when_true(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {}), FakeResponse(200, {})]
+    await connector.get_course_curriculum(access_token="", course_id="c-1_a", brief=True)
+    assert _last_call()[2]["params"] == {"course_id": "c-1_a", "brief": "true"}
+    await connector.get_course_curriculum(access_token="", course_id="c-1_a", brief=False)
+    assert _last_call()[2]["params"] == {"course_id": "c-1_a"}
+
+
+@pytest.mark.parametrize("course_id", ["a", "A-z_9", "a" * 64])
+async def test_course_id_bounds_are_inclusive(connector, course_id) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {})]
+    await connector.get_course_curriculum(access_token="", course_id=course_id)
+    assert _last_call()[2]["params"] == {"course_id": course_id}
+
+
+@pytest.mark.parametrize(
+    "course_id",
+    [
+        "",
+        "a" * 65,
+        "5072786\n",
+        " 5072786",
+        "a/b",
+        "a.b",
+        "a b",
+        "5072786&brief=true",  # query injection
+        "５０７２７８６",  # non-ASCII digits
+        5072786,
+        None,
+        ["a"],
+    ],
+)
+async def test_bad_course_id_rejected_without_echo(connector, course_id) -> None:
+    with pytest.raises(ValueError, match="Invalid course_id") as excinfo:
+        await connector.get_course_curriculum(access_token="", course_id=course_id)
+    assert "5072786" not in str(excinfo.value)
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("brief", ["true", 1, 0, "yes", [True]])
+async def test_non_boolean_brief_rejected(connector, brief) -> None:
+    with pytest.raises(ValueError, match="Invalid brief"):
+        await connector.get_course_curriculum(access_token="", course_id="c1", brief=brief)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_course_curriculum_404_says_no_lecture_list_synced(connector) -> None:
+    FakeAsyncClient.responses = [
+        FakeResponse(404, {"error": "no curriculum", "detail": "secret-internals"})
+    ]
+    with pytest.raises(ValueError, match="No lecture list has been synced") as excinfo:
+        await connector.get_course_curriculum(access_token="", course_id="c1")
+    assert "secret-internals" not in str(excinfo.value)
+
+
+async def test_course_curriculum_other_errors_use_the_shared_mapping(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(400, {"detail": "course_id is malformed"})]
+    with pytest.raises(ValueError, match=r"\(400\): course_id is malformed"):
+        await connector.get_course_curriculum(access_token="", course_id="c1")
+    FakeAsyncClient.responses = [FakeResponse(401, {})]
+    with pytest.raises(ValueError, match=r"agent key \(401\).*LIFEBOT_AGENT_KEY"):
+        await connector.get_course_curriculum(access_token="", course_id="c1")
+    FakeAsyncClient.responses = [FakeResponse(503, {})]
+    with pytest.raises(ValueError, match="not configured on the Lifebot side"):
+        await connector.get_course_curriculum(access_token="", course_id="c1")
+
+
+async def test_jsonrpc_dispatch_reaches_get_course_curriculum(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"course_id": "c1"})]
+    result = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "get_course_curriculum", "arguments": {"course_id": "c1", "brief": True}},
+        request_id=8,
+        access_token="",
+    )
+    assert "error" not in result
+    assert _last_call()[2]["params"] == {"course_id": "c1", "brief": "true"}
+    FakeAsyncClient.responses = [FakeResponse(404, {})]
+    missing = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "get_course_curriculum", "arguments": {"course_id": "c2"}},
+        request_id=9,
+        access_token="",
+    )
+    assert missing["result"]["isError"] is True
+    assert "No lecture list has been synced" in missing["result"]["content"][0]["text"]

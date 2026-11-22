@@ -10,7 +10,7 @@ routes. Neither is ever logged or returned in a tool result or error message.
 
 Least-privilege by design (mirrors the gcp/tailscale/gitlab connectors):
 - read tools: daily brief, metric time series, workouts, goals, study progress,
-  study plan, dated daily study tasks, messages.
+  study plan, dated daily study tasks, course lecture lists, messages.
 - three write tools, using the separate write key: save a study plan as a PROPOSAL
   (the owner accepts or discards it on his page), replace the daily study tasks for
   a date range, and post an assistant reply. Nothing else can be written through
@@ -39,6 +39,7 @@ _WRITE_HEADER = "x-lifebot-agent-write-key"
 _HTTP_TIMEOUT = 30.0
 _HTTP_BAD_REQUEST = 400
 _HTTP_UNAUTHORIZED = 401
+_HTTP_NOT_FOUND = 404
 _HTTP_CONFLICT = 409
 _HTTP_RATE_LIMITED = 429
 _HTTP_UNAVAILABLE = 503
@@ -61,6 +62,7 @@ _TASKS_MAX_BYTES = 102400
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 _METRIC_NAME_RE = re.compile(r"[a-z0-9_]{1,64}")
 _CONVERSATION_RE = re.compile(r"[a-z0-9_-]{1,32}")
+_COURSE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # https://host[:port][/base/path] — no whitespace, query or fragment.
 _API_URL_RE = re.compile(r"https://[^\s/?#]+(/[^\s?#]*)?")
 
@@ -135,6 +137,18 @@ def _validate_names(names: list[str] | str) -> str:
     if not 1 <= len(unique) <= _NAMES_MAX:
         raise ValueError(f"Invalid names: provide 1-{_NAMES_MAX} distinct metric names")
     return ",".join(unique)
+
+
+def _validate_course_id(course_id: str) -> str:
+    if not isinstance(course_id, str) or not _COURSE_ID_RE.fullmatch(course_id):
+        raise ValueError("Invalid course_id (expected [A-Za-z0-9_-], 1-64 chars)")
+    return course_id
+
+
+def _validate_brief(brief: bool) -> bool:
+    if not isinstance(brief, bool):
+        raise ValueError(f"Invalid brief: {brief!r} (expected true or false)")
+    return brief
 
 
 def _validate_limit(limit: int) -> int:
@@ -227,11 +241,13 @@ def _bad_request_detail(response: Any) -> str:
     return detail[:_DETAIL_MAX_CHARS]
 
 
-def _raise_for_status(response: Any, *, write: bool = False) -> None:
+def _raise_for_status(response: Any, *, write: bool = False, not_found: str | None = None) -> None:
     """Map upstream errors to short messages — no URLs, bodies, or either key."""
     status = response.status_code
     if status < _HTTP_ERROR_FLOOR:
         return
+    if status == _HTTP_NOT_FOUND and not_found is not None:
+        raise ValueError(not_found)
     if status == _HTTP_UNAUTHORIZED:
         if write:
             raise ValueError(
@@ -254,7 +270,9 @@ def _raise_for_status(response: Any, *, write: bool = False) -> None:
     raise ValueError(f"Lifebot API error {status}")
 
 
-async def _lifebot_get(path: str, params: dict[str, str] | None = None) -> Any:
+async def _lifebot_get(
+    path: str, params: dict[str, str] | None = None, *, not_found: str | None = None
+) -> Any:
     key = _agent_key()
     base = _api_base()
     try:
@@ -267,7 +285,7 @@ async def _lifebot_get(path: str, params: dict[str, str] | None = None) -> Any:
     except httpx.HTTPError:
         # Transport errors can embed the request URL — report none of it.
         raise ValueError("Lifebot API is unreachable (network error or timeout)") from None
-    _raise_for_status(response)
+    _raise_for_status(response, not_found=not_found)
     try:
         return response.json()
     except ValueError:
@@ -615,6 +633,37 @@ _GET_STUDY_TASKS_META = NativeToolMeta(
     },
 )
 
+_GET_COURSE_CURRICULUM_META = NativeToolMeta(
+    name="get_course_curriculum",
+    description=(
+        "Get the lecture list of one of the owner's Udemy courses as last synced from "
+        "his browser: sections with their lectures, quizzes and practice items in order, "
+        "each with minutes when known, whether it is done, and a direct url; plus totals "
+        "and next, the first not-done items. Use the course ids from get_study. Use "
+        "brief=true when only the next items are needed. A 404 means no lecture list "
+        "has been synced for that course yet (only the active plan's focus courses are "
+        "synced), so say so instead of guessing lecture names. " + _PRIVACY_NOTE
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "course_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                "description": (
+                    "A course id exactly as returned by get_study (letters, digits, "
+                    "hyphen, underscore; 1-64 chars)."
+                ),
+            },
+            "brief": {
+                "type": "boolean",
+                "description": "Omit the full section list; keep totals and next (default false).",
+            },
+        },
+        "required": ["course_id"],
+    },
+)
+
 _TASK_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -827,6 +876,21 @@ class LifebotConnector(NativeConnector):
         args = _take_arguments(arguments, ("from", "to"))
         params = {key: _validate_date(args[key]) for key in ("from", "to") if key in args}
         return _mcp_text_content(await _lifebot_get("/agent/study-tasks", params))
+
+    @native_tool(_GET_COURSE_CURRICULUM_META)
+    async def get_course_curriculum(
+        self, *, access_token: str = "", course_id: str, brief: bool | None = None
+    ) -> list[dict[str, Any]]:
+        params = {"course_id": _validate_course_id(course_id)}
+        if brief is not None and _validate_brief(brief):
+            params["brief"] = "true"
+        not_found = (
+            "No lecture list has been synced for this course yet (404); only the active "
+            "plan's focus courses are synced"
+        )
+        return _mcp_text_content(
+            await _lifebot_get("/agent/study-curriculum", params, not_found=not_found)
+        )
 
     @native_tool(_SAVE_STUDY_PLAN_META)
     async def save_study_plan(
