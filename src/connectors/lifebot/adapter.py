@@ -611,7 +611,9 @@ _GET_STUDY_TASKS_META = NativeToolMeta(
         "(id, title, minutes, kind, optional url, link_label, course_id and note, done "
         "and done_at) with planned and done minutes, plus totals for the range. "
         "Defaults to today plus six days; at most 35 days. Use it to see what the owner "
-        "has ticked off and what is already planned before saving new tasks. " + _PRIVACY_NOTE
+        "has ticked off and what is already planned before saving new tasks. Tasks may "
+        "include lecture_ids, auto_tick (the task will tick itself) and done_by: "
+        '"udemy" (it was ticked automatically). ' + _PRIVACY_NOTE
     ),
     input_schema={
         "type": "object",
@@ -710,6 +712,19 @@ _TASK_SCHEMA = {
                 "one. Unknown ids are still saved and listed in unknown_course_ids."
             ),
         },
+        "lecture_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "uniqueItems": True,
+            "items": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+            "description": (
+                "Ids of the lectures, quizzes or practice items this task covers, as the "
+                "id of each item from get_course_curriculum. 1-20 unique ids. Only valid "
+                "together with course_id. The task is ticked automatically once the "
+                "owner's Udemy progress shows all of them done."
+            ),
+        },
         "note": {
             "type": "string",
             "maxLength": 300,
@@ -732,7 +747,12 @@ _SAVE_STUDY_TASKS_META = NativeToolMeta(
         "there and what is done. Limits: from must be today (the owner's local date) "
         "or later, from not after to, at most 14 days inclusive; every task date "
         "inside from..to; at most 60 tasks in the call and 8 per date; url must be "
-        "https. Returns saved, kept_done, removed and unknown_course_ids. On a 400 the "
+        "https. A task may carry lecture_ids (1-20 unique ids from get_course_curriculum, "
+        "the id of each lecture, quiz or practice item), only together with course_id. "
+        "A task with lecture_ids is ticked automatically once the owner's Udemy progress "
+        "shows all of them done, so set lecture_ids whenever a task covers specific "
+        "lectures, and set that task's url to the first of those lectures' own url. "
+        "Returns saved, kept_done, removed and unknown_course_ids. On a 400 the "
         "message says which field is wrong; fix it and call again."
     ),
     input_schema={

@@ -120,13 +120,14 @@ async def test_exactly_the_specified_tools_are_registered(connector) -> None:
         "course_id",
         "date",
         "kind",
+        "lecture_ids",
         "link_label",
         "minutes",
         "note",
         "title",
         "url",
     ]
-    for server_assigned in ("id", "order", "done"):
+    for server_assigned in ("id", "order", "done", "done_by", "auto_tick"):
         assert server_assigned not in task["properties"]
     assert task["properties"]["kind"]["enum"] == [
         "video",
@@ -1069,6 +1070,40 @@ async def test_save_study_tasks_passes_full_tasks_through_unchanged(connector) -
         {"date": "2026-11-24", "title": "Review", "minutes": 5, "kind": "review"},
     ]
     FakeAsyncClient.responses = [FakeResponse(200, {"saved": 2})]
+    await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": tasks})
+    assert _last_call()[2]["json"]["tasks"] == tasks
+
+
+async def test_study_task_tools_describe_lecture_ids_and_automatic_ticking(connector) -> None:
+    result = await connector.handle_mcp_request(
+        method="tools/list", params={}, request_id=1, access_token=""
+    )
+    tools = {t["name"]: t for t in result["result"]["tools"]}
+    save = tools["save_study_tasks"]
+    lecture_ids = save["inputSchema"]["properties"]["tasks"]["items"]["properties"]["lecture_ids"]
+    assert lecture_ids["minItems"] == 1
+    assert lecture_ids["maxItems"] == 20
+    assert lecture_ids["uniqueItems"] is True
+    assert lecture_ids["items"]["pattern"] == "^[A-Za-z0-9_-]{1,64}$"
+    assert "course_id" in lecture_ids["description"]
+    assert "get_course_curriculum" in lecture_ids["description"]
+    assert "ticked automatically" in lecture_ids["description"]
+    assert "ticked automatically" in save["description"]
+    assert "auto_tick" in tools["get_study_tasks"]["description"]
+    assert 'done_by: "udemy"' in tools["get_study_tasks"]["description"]
+
+
+async def test_save_study_tasks_passes_lecture_ids_through_unchanged(connector) -> None:
+    tasks = [
+        {
+            "date": "2026-11-23",
+            "title": "Lectures 3-4",
+            "minutes": 30,
+            "course_id": "course-a",
+            "lecture_ids": ["lec_1", "lec-2"],
+        }
+    ]
+    FakeAsyncClient.responses = [FakeResponse(200, {"saved": 1})]
     await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": tasks})
     assert _last_call()[2]["json"]["tasks"] == tasks
 
