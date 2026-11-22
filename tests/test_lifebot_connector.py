@@ -93,9 +93,11 @@ async def test_exactly_the_specified_tools_are_registered(connector) -> None:
         "get_metrics",
         "get_study",
         "get_study_plan",
+        "get_study_tasks",
         "get_workouts",
         "post_reply",
         "save_study_plan",
+        "save_study_tasks",
     ]
     assert all(t["inputSchema"]["type"] == "object" for t in tools)
     metrics = next(t for t in tools if t["name"] == "get_metrics")
@@ -105,6 +107,37 @@ async def test_exactly_the_specified_tools_are_registered(connector) -> None:
     assert save["inputSchema"]["properties"]["plan"]["required"] == ["goal", "focus"]
     reply = next(t for t in tools if t["name"] == "post_reply")
     assert reply["inputSchema"]["required"] == ["text"]
+    get_tasks = next(t for t in tools if t["name"] == "get_study_tasks")
+    assert sorted(get_tasks["inputSchema"]["properties"]) == ["from", "to"]
+    assert "required" not in get_tasks["inputSchema"]
+    save_tasks = next(t for t in tools if t["name"] == "save_study_tasks")
+    assert save_tasks["inputSchema"]["required"] == ["from", "to", "tasks"]
+    task = save_tasks["inputSchema"]["properties"]["tasks"]["items"]
+    assert task["required"] == ["date", "title", "minutes"]
+    assert task["additionalProperties"] is False
+    assert sorted(task["properties"]) == [
+        "course_id",
+        "date",
+        "kind",
+        "link_label",
+        "minutes",
+        "note",
+        "title",
+        "url",
+    ]
+    for server_assigned in ("id", "order", "done"):
+        assert server_assigned not in task["properties"]
+    assert task["properties"]["kind"]["enum"] == [
+        "video",
+        "reading",
+        "lab",
+        "practice",
+        "review",
+        "exam",
+        "other",
+    ]
+    assert save_tasks["inputSchema"]["properties"]["tasks"]["maxItems"] == 60
+    assert "REPLACES" in save_tasks["description"]
 
 
 def test_meta_is_a_static_credential_native_connector(connector) -> None:
@@ -491,6 +524,8 @@ PLAN = {
     "goal": "Finish the networking course",
     "focus": [{"course_id": "course-a", "order": 1}],
 }
+TASK = {"date": "2026-11-23", "title": "Watch lecture 4", "minutes": 45}
+TASKS_CALL: dict[str, Any] = {"from": "2026-11-23", "to": "2026-11-29", "tasks": [TASK]}
 
 
 def _assert_only_key(kwargs: dict, header: str, key: str) -> None:
@@ -808,10 +843,12 @@ READ_CALLS = [
     lambda c: c.get_study(access_token=""),
     lambda c: c.get_study_plan(access_token=""),
     lambda c: c.get_messages(access_token=""),
+    lambda c: c.get_study_tasks(access_token=""),
 ]
 WRITE_CALLS = [
     lambda c: c.save_study_plan(access_token="", plan=PLAN),
     lambda c: c.post_reply(access_token="", text="hi"),
+    lambda c: c.save_study_tasks(access_token="", **TASKS_CALL),
 ]
 
 
@@ -917,7 +954,8 @@ async def test_each_key_goes_only_to_its_own_routes(connector) -> None:
     FakeAsyncClient.responses += [FakeResponse(201, {}) for _ in WRITE_CALLS]
     for call in [*READ_CALLS, *WRITE_CALLS]:
         await call(connector)
-    reads, writes = FakeAsyncClient.calls[:3], FakeAsyncClient.calls[3:]
+    reads = FakeAsyncClient.calls[: len(READ_CALLS)]
+    writes = FakeAsyncClient.calls[len(READ_CALLS) :]
     for method, _, kwargs in reads:
         assert method == "GET"
         _assert_only_key(kwargs, READ_HEADER, KEY)
@@ -970,3 +1008,226 @@ async def test_jsonrpc_dispatch_reaches_the_write_tools(connector) -> None:
     method, url, kwargs = _last_call()
     assert (method, url) == ("POST", f"{BASE}/agent/messages/reply")
     assert kwargs["json"] == {"text": "hi", "conversation": "main"}
+
+
+# === STUDY TASKS: HAPPY PATHS ===
+
+
+async def test_get_study_tasks_defaults_send_no_params_and_the_read_key(connector) -> None:
+    payload = {"from": "2026-11-22", "to": "2026-11-28", "days": [], "totals": {"tasks": 0}}
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.get_study_tasks(access_token="")
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("GET", f"{BASE}/agent/study-tasks")
+    assert kwargs["params"] == {}
+    assert "json" not in kwargs
+    _assert_only_key(kwargs, READ_HEADER, KEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_get_study_tasks_passes_from_and_to(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {}), FakeResponse(200, {})]
+    await connector.get_study_tasks(access_token="", **{"from": "2026-11-01"})
+    assert _last_call()[2]["params"] == {"from": "2026-11-01"}
+    await connector.get_study_tasks(access_token="", **{"from": "2026-11-01", "to": "2026-12-05"})
+    assert _last_call()[2]["params"] == {"from": "2026-11-01", "to": "2026-12-05"}
+
+
+async def test_save_study_tasks_puts_the_range_with_the_write_key_only(connector) -> None:
+    payload = {
+        "from": "2026-11-23",
+        "to": "2026-11-29",
+        "saved": 1,
+        "kept_done": 0,
+        "removed": 2,
+        "unknown_course_ids": [],
+    }
+    FakeAsyncClient.responses = [FakeResponse(200, payload)]
+    content = await connector.save_study_tasks(access_token="", **TASKS_CALL)
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("PUT", f"{BASE}/agent/study-tasks")
+    assert kwargs["json"] == TASKS_CALL
+    assert "params" not in kwargs
+    _assert_only_key(kwargs, WRITE_HEADER, WKEY)
+    assert json.loads(content[0]["text"]) == payload
+
+
+async def test_save_study_tasks_passes_full_tasks_through_unchanged(connector) -> None:
+    tasks = [
+        {
+            "date": "2026-11-23",
+            "title": "Lab: subnetting ☕",
+            "minutes": 60,
+            "kind": "lab",
+            "url": "https://example.com/lab",
+            "link_label": "Lab",
+            "course_id": "course-a",
+            "note": "Do the second exercise first",
+        },
+        {"date": "2026-11-24", "title": "Review", "minutes": 5, "kind": "review"},
+    ]
+    FakeAsyncClient.responses = [FakeResponse(200, {"saved": 2})]
+    await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": tasks})
+    assert _last_call()[2]["json"]["tasks"] == tasks
+
+
+async def test_save_study_tasks_accepts_an_empty_list_and_sixty_tasks(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"saved": 0}), FakeResponse(200, {"saved": 60})]
+    await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": []})
+    assert _last_call()[2]["json"]["tasks"] == []
+    sixty = [TASK] * 60
+    await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": sixty})
+    assert _last_call()[2]["json"]["tasks"] == sixty
+
+
+# === STUDY TASKS: VALIDATION (rejected before any HTTP) ===
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "2026-13-01",  # not a real date
+        "2026-02-30",
+        "2026-11-2",
+        "2026-11-22\n",
+        "٢٠٢٦-١١-٢٢",  # non-ASCII digits
+        "tomorrow",
+        "",
+        20261122,
+        None,
+        ["2026-11-22"],
+    ],
+)
+async def test_study_tasks_reject_bad_dates(connector, bad) -> None:
+    with pytest.raises(ValueError, match="Invalid date"):
+        await connector.get_study_tasks(access_token="", **{"from": bad})
+    with pytest.raises(ValueError, match="Invalid date"):
+        await connector.get_study_tasks(access_token="", to=bad)
+    with pytest.raises(ValueError, match="Invalid date"):
+        await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "from": bad})
+    with pytest.raises(ValueError, match="Invalid date"):
+        await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "to": bad})
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize(
+    "tasks",
+    [
+        None,
+        "tasks",
+        {"date": "2026-11-23"},
+        [TASK, "x"],
+        [TASK, None],
+        [[TASK]],
+        [{"n": float("nan")}],
+    ],
+)
+async def test_save_study_tasks_rejects_malformed_tasks(connector, tasks) -> None:
+    with pytest.raises(ValueError, match="Invalid tasks"):
+        await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": tasks})
+    assert FakeAsyncClient.calls == []
+
+
+async def test_save_study_tasks_rejects_sixty_one_tasks(connector) -> None:
+    with pytest.raises(ValueError, match="at most 60"):
+        await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": [TASK] * 61})
+    assert FakeAsyncClient.calls == []
+
+
+async def test_save_study_tasks_rejects_oversized_payload(connector) -> None:
+    big = [{**TASK, "note": "x" * 2000} for _ in range(60)]
+    with pytest.raises(ValueError, match="too large"):
+        await connector.save_study_tasks(access_token="", **{**TASKS_CALL, "tasks": big})
+    assert FakeAsyncClient.calls == []
+
+
+@pytest.mark.parametrize("missing", ["from", "to", "tasks"])
+async def test_save_study_tasks_requires_all_arguments(connector, missing) -> None:
+    arguments = {key: value for key, value in TASKS_CALL.items() if key != missing}
+    with pytest.raises(ValueError, match=f"Missing argument.*{missing}"):
+        await connector.save_study_tasks(access_token="", **arguments)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_unknown_arguments_are_rejected_before_any_http(connector) -> None:
+    with pytest.raises(ValueError, match="Unknown argument.*days"):
+        await connector.get_study_tasks(access_token="", days=7)
+    with pytest.raises(ValueError, match="Unknown argument.*conversation"):
+        await connector.save_study_tasks(access_token="", conversation="main", **TASKS_CALL)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_study_tasks_validation_errors_do_not_echo_task_content(connector) -> None:
+    secret = "private-task-title-sentinel"
+    with pytest.raises(ValueError) as excinfo:
+        await connector.save_study_tasks(
+            access_token="", **{**TASKS_CALL, "tasks": [{"title": secret}, secret]}
+        )
+    assert secret not in str(excinfo.value)
+
+
+# === STUDY TASKS: CONFIGURATION AND UPSTREAM ERRORS ===
+
+
+async def test_save_study_tasks_needs_the_write_key_before_any_http(connector, monkeypatch) -> None:
+    monkeypatch.delenv("LIFEBOT_AGENT_WRITE_KEY")
+    with pytest.raises(ValueError, match="Lifebot write key is not configured on the broker"):
+        await connector.save_study_tasks(access_token="", **TASKS_CALL)
+    assert FakeAsyncClient.calls == []
+
+
+async def test_study_tasks_tools_use_only_their_own_key(connector, monkeypatch) -> None:
+    monkeypatch.delenv("LIFEBOT_AGENT_KEY")
+    FakeAsyncClient.responses = [FakeResponse(200, {})]
+    await connector.save_study_tasks(access_token="", **TASKS_CALL)
+    assert _last_call()[2]["headers"] == {WRITE_HEADER: WKEY}
+    monkeypatch.setenv("LIFEBOT_AGENT_KEY", KEY)
+    monkeypatch.delenv("LIFEBOT_AGENT_WRITE_KEY")
+    FakeAsyncClient.responses = [FakeResponse(200, {})]
+    await connector.get_study_tasks(access_token="")
+    assert _last_call()[2]["headers"] == {READ_HEADER: KEY}
+
+
+async def test_save_study_tasks_400_surfaces_the_api_detail(connector) -> None:
+    detail = "tasks[3].minutes must be an integer from 5 to 240"
+    FakeAsyncClient.responses = [FakeResponse(400, {"error": "invalid tasks", "detail": detail})]
+    with pytest.raises(ValueError) as excinfo:
+        await connector.save_study_tasks(access_token="", **TASKS_CALL)
+    assert str(excinfo.value) == f"Lifebot rejected a parameter (400): {detail}"
+
+
+async def test_get_study_tasks_400_surfaces_the_api_detail(connector) -> None:
+    detail = "range is longer than 35 days"
+    FakeAsyncClient.responses = [FakeResponse(400, {"error": "invalid range", "detail": detail})]
+    with pytest.raises(ValueError, match=r"\(400\): range is longer than 35 days"):
+        await connector.get_study_tasks(access_token="")
+
+
+async def test_jsonrpc_dispatch_reaches_the_study_tasks_tools(connector) -> None:
+    FakeAsyncClient.responses = [FakeResponse(200, {"saved": 1}), FakeResponse(200, {"days": []})]
+    saved = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "save_study_tasks", "arguments": TASKS_CALL},
+        request_id=4,
+        access_token="",
+    )
+    assert "error" not in saved
+    method, url, kwargs = _last_call()
+    assert (method, url) == ("PUT", f"{BASE}/agent/study-tasks")
+    assert kwargs["json"] == TASKS_CALL
+    got = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "get_study_tasks", "arguments": {"from": "2026-11-23"}},
+        request_id=5,
+        access_token="",
+    )
+    assert "error" not in got
+    assert _last_call()[2]["params"] == {"from": "2026-11-23"}
+    bad = await connector.handle_mcp_request(
+        method="tools/call",
+        params={"name": "save_study_tasks", "arguments": {"from": "2026-11-23"}},
+        request_id=6,
+        access_token="",
+    )
+    assert bad["result"]["isError"] is True
+    assert "Missing argument" in bad["result"]["content"][0]["text"]

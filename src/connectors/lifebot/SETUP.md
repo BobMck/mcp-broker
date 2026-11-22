@@ -3,9 +3,10 @@
 Native connector (`auth_mode="none"`), credentials = two static keys for the
 Lifebot agent API. It lets an AI assistant read compact, pre-computed summaries of
 the owner's personal health data (a daily brief, metric time series, workouts and
-goals), the owner's study progress and study plan, and the web page conversation.
-No raw health rows are exposed. The two write tools only ever create study plan
-*proposals* and chat *replies*; they cannot activate a plan or change any health
+goals), the owner's study progress, study plan and dated daily study tasks, and the
+web page conversation. No raw health rows are exposed. The three write tools only
+ever create study plan *proposals*, replace the not-done daily study tasks in a date
+range, and post chat *replies*; they cannot activate a plan or change any health
 data, goals or courses.
 
 ## Get the key (Lifebot side — manual)
@@ -18,7 +19,7 @@ data, goals or courses.
 4. For the write tools, also generate the separate Lifebot write key and load it as
    `LIFEBOT_AGENT_WRITE_KEY`. The read key never works on the write routes, and the
    write key never works on the read routes. Without the write key the read tools
-   keep working and the two write tools report that the write key is not configured.
+   keep working and the write tools report that the write key is not configured.
 
 To rotate: generate a new key on the Lifebot side, update the secret in your secret
 manager and the broker's environment, then restart or redeploy the broker. The old
@@ -32,7 +33,7 @@ rotates the same way; a `401` from a write tool names `LIFEBOT_AGENT_WRITE_KEY`.
 |---|---|---|
 | `LIFEBOT_API_URL` | yes | Base URL of the Lifebot agent API, e.g. `https://lifebot.example.com`. Must be `https://`; a trailing slash is stripped |
 | `LIFEBOT_AGENT_KEY` | yes | Agent key (secret). Sent only in the `x-lifebot-agent-key` header, on read routes |
-| `LIFEBOT_AGENT_WRITE_KEY` | for the write tools | Write key (secret), a different key from the above. Sent only in the `x-lifebot-agent-write-key` header, on the two write routes |
+| `LIFEBOT_AGENT_WRITE_KEY` | for the write tools | Write key (secret), a different key from the above. Sent only in the `x-lifebot-agent-write-key` header, on the write routes |
 
 ## Tools
 
@@ -45,7 +46,9 @@ rotates the same way; a `401` from a write tool names `LIFEBOT_AGENT_WRITE_KEY`.
 | `get_study` | `days` (optional, 1-365) | Online courses with completion, focus under the active plan, recent progress, pace, projected finish, stalled flag, and caveats in `notes` |
 | `get_study_plan` | none | The active study plan and any proposed plan awaiting the owner's decision |
 | `get_messages` | `conversation` (optional, `[a-z0-9_-]{1,32}`), `limit` (optional, 1-50) | Recent web page conversation messages, oldest first |
+| `get_study_tasks` | `from`, `to` (both optional, `YYYY-MM-DD`; default today to today plus six days; at most 35 days) | The owner's dated daily study tasks per day, with what is done, planned and done minutes, and totals |
 | `save_study_plan` | `plan` (object: `goal` and `focus` required; at most 20 KB) | Saves a plan as a **proposal**; the owner accepts or discards it on his page. Returns `version`, `status: "proposed"`, `unknown_course_ids`. Write key |
+| `save_study_tasks` | `from`, `to` (`YYYY-MM-DD`, `from` today or later, at most 14 days), `tasks` (up to 60, at most 8 per date; each `date`, `title`, `minutes`, optional `kind`, `url` (https), `link_label`, `course_id`, `note`) | **Replaces** the plan for the whole range: every not-done task in it is removed, done tasks are kept, then the given tasks are added. Returns `saved`, `kept_done`, `removed`, `unknown_course_ids`. Write key |
 | `post_reply` | `text` (1-8000 chars), `conversation` (optional) | Posts the assistant's reply to the owner's web page. Write key |
 
 Dates are the owner's local calendar dates, except study course snapshots, which are
