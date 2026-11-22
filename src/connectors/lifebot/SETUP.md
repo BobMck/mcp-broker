@@ -3,7 +3,7 @@
 Native connector (`auth_mode="none"`), credentials = two static keys for the
 Lifebot agent API. It lets an AI assistant read compact, pre-computed summaries of
 the owner's personal health data (a daily brief, metric time series, workouts and
-goals), the owner's study progress, study plan and dated daily study tasks, and the
+goals), the owner's study progress, study plan, dated daily study tasks and course lecture lists, and the
 web page conversation. No raw health rows are exposed. The three write tools only
 ever create study plan *proposals*, replace the not-done daily study tasks in a date
 range, and post chat *replies*; they cannot activate a plan or change any health
@@ -47,6 +47,7 @@ rotates the same way; a `401` from a write tool names `LIFEBOT_AGENT_WRITE_KEY`.
 | `get_study_plan` | none | The active study plan and any proposed plan awaiting the owner's decision |
 | `get_messages` | `conversation` (optional, `[a-z0-9_-]{1,32}`), `limit` (optional, 1-50) | Recent web page conversation messages, oldest first |
 | `get_study_tasks` | `from`, `to` (both optional, `YYYY-MM-DD`; default today to today plus six days; at most 35 days) | The owner's dated daily study tasks per day, with what is done, planned and done minutes, and totals |
+| `get_course_curriculum` | `course_id` (from `get_study`, `[A-Za-z0-9_-]{1,64}`), `brief` (optional, boolean) | The lecture list of one Udemy course as last synced from the owner's browser: sections with lectures, quizzes and practice items in order (minutes when known, done, direct url), plus totals and `next`, the first not-done items. `brief=true` omits the sections. A 404 means no lecture list is synced for that course yet (only the active plan's focus courses are synced) |
 | `save_study_plan` | `plan` (object: `goal` and `focus` required; at most 20 KB) | Saves a plan as a **proposal**; the owner accepts or discards it on his page. Returns `version`, `status: "proposed"`, `unknown_course_ids`. Write key |
 | `save_study_tasks` | `from`, `to` (`YYYY-MM-DD`, `from` today or later, at most 14 days), `tasks` (up to 60, at most 8 per date; each `date`, `title`, `minutes`, optional `kind`, `url` (https), `link_label`, `course_id`, `note`) | **Replaces** the plan for the whole range: every not-done task in it is removed, done tasks are kept, then the given tasks are added. Returns `saved`, `kept_done`, `removed`, `unknown_course_ids`. Write key |
 | `post_reply` | `text` (1-8000 chars), `conversation` (optional) | Posts the assistant's reply to the owner's web page. Write key |
